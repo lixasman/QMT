@@ -1,0 +1,14 @@
+- [x] `exit/` 模块文件边界严格匹配 Spec 与用户清单（不合并/不改名）
+- [x] 所有 `exit/*.py` 首行均为 `from __future__ import annotations`
+- [x] 类型注解完整，外部输入显式转型（float/int/str）
+- [x] 运行时断言均以 `raise AssertionError(...)` 实现（无 `assert` 语句）
+- [x] Score_soft 仅含 4 信号且权重固定；`Score_soft == 0` 精确比较
+- [x] S_chip 输出仅允许 `{0,0.3,0.5,0.7,1.0}`，冷启动/时效性正确降级为 UNAVAILABLE
+- [x] Chandelier ATR 使用 Wilder EMA(12)；Stop 盘前计算盘中仅比较；k 单调递减且仅三档
+- [x] Layer 1 触发判定仅 `last_price < Stop`；Layer 2 触发判定仅 `Score_soft ≥ 0.9`
+- [x] 救生衣启用/回补条件与禁止条件完全对齐（30 交易分钟、排除午休、14:30 截止、跌停价×1.02）
+- [x] Layer 1 卖出价使用 `Bid1×0.98` + `tick_floor` + 跌停价兜底；Layer 2 卖出价使用 `Bid1` + `tick_floor`
+- [x] 所有卖出数量限制在 `sellable_qty`；存在 `locked_qty` 时写 pending 并次日 09:30 无条件执行
+- [x] 崩溃恢复遵循“券商持仓 + 当日委托”为真相，避免重复下单
+- [x] JSONL 日志覆盖 Layer1/Layer2/Lifeboat/Rejected，字段与验证套件 §4.1-4.4 一致
+- [x] 22 个验收场景（Part 2）均有自动化测试并全部通过
