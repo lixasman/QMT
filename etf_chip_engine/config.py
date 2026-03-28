@@ -20,6 +20,10 @@ ETF_EXCLUDE_KEYWORDS: list[str] = [
     "日经",
     "德国",
     "法国",
+    "港股",
+    "H股",
+    "沪港深",
+    "联接",
 ]
 
 
@@ -46,7 +50,26 @@ CONFIG: dict[str, object] = {
     "cold_start_lookback": 60,
     "cold_start_decay": 0.95,
     "daily_tick_count": -1,
-    "tick_download_chunk_timeout_sec": 45,
+    "industry_etf_max_constituents": 200,
+    "industry_etf_min_a_share_ratio": 0.95,
+    "premium_iopv_min_coverage": 0.95,
+    "empty_tick_retry_timeout_sec": 20,
+    # When a retry download succeeds but query is still empty, poll briefly for local cache to catch up.
+    "empty_tick_post_retry_wait_sec": 6.0,
+    "empty_tick_post_retry_poll_sec": 1.0,
+    "tick_download_chunk_size": 80,
+    "tick_download_chunk_timeout_sec": 20,
+    # Pre-filter by recent 1d liquidity before tick pre-download.
+    "liquidity_prefilter_enabled": 1,
+    "liquidity_prefilter_lookback_days": 60,
+    "liquidity_prefilter_min_active_days": 45,
+    "liquidity_prefilter_min_median_amount": 2000000.0,
+    "liquidity_prefilter_min_median_volume": 0.0,
+    "liquidity_prefilter_chunk_size": 400,
+    # Stable compute pool: reuse a fixed pool and refresh periodically.
+    "liquidity_prefilter_stable_pool_enabled": 1,
+    "liquidity_prefilter_pool_refresh_days": 30,
+    "liquidity_prefilter_pool_state_path": str(Path("output") / "cache" / "chip_compute_pool" / "stable_pool.json"),
     "snapshot_dir": str(_BASE_DIR / "data" / "snapshots"),
     "chip_snapshot_dir": str(_BASE_DIR / "data" / "chip_snapshots"),
     "l1_snapshot_dir": str(_BASE_DIR / "data" / "l1_snapshots"),

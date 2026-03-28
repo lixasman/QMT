@@ -72,8 +72,8 @@ def test_retry_download_for_empty_tick_code_once_per_day(tmp_path, monkeypatch) 
     monkeypatch.setattr(xtp, "download_tick_data", fake_download)
     trade_date = "20260224"
 
-    first = xtp.retry_download_for_empty_tick_code_once("510300.SH", trade_date, state_dir=tmp_path)
-    second = xtp.retry_download_for_empty_tick_code_once("510300.SH", trade_date, state_dir=tmp_path)
+    first = xtp.retry_download_for_empty_tick_code_once("510300.SH", trade_date, state_dir=tmp_path, timeout_sec=0)
+    second = xtp.retry_download_for_empty_tick_code_once("510300.SH", trade_date, state_dir=tmp_path, timeout_sec=0)
 
     assert first is True
     assert second is False
@@ -81,6 +81,37 @@ def test_retry_download_for_empty_tick_code_once_per_day(tmp_path, monkeypatch) 
 
     state = _read_state(tmp_path / f"tick_{trade_date}.json")
     assert "510300.SH" in state["empty_retry_codes"]
+
+
+def test_retry_download_for_empty_tick_code_once_timeout_warns_and_marks_retry(tmp_path, monkeypatch, capsys) -> None:
+    trade_date = "20260224"
+    calls: list[list[str]] = []
+
+    def fake_timeout(codes: list[str], td: str, *, timeout_sec: int):
+        assert td == trade_date
+        assert timeout_sec == 5
+        return [], list(codes)
+
+    def fake_download(codes: list[str], td: str) -> None:
+        calls.append(list(codes))
+
+    monkeypatch.setattr(xtp, "_download_tick_data_with_timeout", fake_timeout)
+    monkeypatch.setattr(xtp, "download_tick_data", fake_download)
+
+    first = xtp.retry_download_for_empty_tick_code_once("510300.SH", trade_date, state_dir=tmp_path, timeout_sec=5)
+    second = xtp.retry_download_for_empty_tick_code_once("510300.SH", trade_date, state_dir=tmp_path, timeout_sec=5)
+
+    assert first is True
+    assert second is False
+    assert calls == []
+
+    state = _read_state(tmp_path / f"tick_{trade_date}.json")
+    assert "510300.SH" in state["empty_retry_codes"]
+    assert "510300.SH" not in state["downloaded_codes"]
+
+    out = capsys.readouterr().out
+    assert "[WARN]" in out
+    assert "empty-tick retry timeout/failed" in out
 
 
 def test_ensure_tick_data_downloaded_handles_corrupted_state(tmp_path, monkeypatch) -> None:

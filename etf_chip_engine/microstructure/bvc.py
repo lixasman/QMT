@@ -153,6 +153,8 @@ class BulkVolumeClassifier:
         self,
         snapshots: pd.DataFrame,
         microprice: np.ndarray | None = None,
+        *,
+        tick_size: float | None = None,
     ) -> BVCResult:
         """Classify each snapshot's volume into buy/sell.
 
@@ -163,6 +165,9 @@ class BulkVolumeClassifier:
         microprice : np.ndarray or None
             Microprice series from M1.  If *None*, falls back to V1
             behaviour (close-only CDF).
+        tick_size : float or None
+            Price tick size used for Level-2 microprice-diff threshold.
+            When provided, Level-2 gate becomes ``2 * tick_size``.
 
         Returns
         -------
@@ -182,10 +187,18 @@ class BulkVolumeClassifier:
 
         if microprice is not None and len(microprice) == n:
             mp = np.asarray(microprice, dtype=np.float64)
+            level2_min_dm = float(self.level2_min_dm)
+            if tick_size is not None:
+                try:
+                    ts = float(tick_size)
+                except Exception:
+                    ts = 0.0
+                if np.isfinite(ts) and ts > 0:
+                    level2_min_dm = 2.0 * ts
             signal, levels = _compute_signal(
                 close, mp,
                 k_max=self.k_max,
-                level2_min_dm=self.level2_min_dm,
+                level2_min_dm=level2_min_dm,
             )
             sigma = _compute_per_level_sigma(signal, levels, lookback=self.lookback)
         else:

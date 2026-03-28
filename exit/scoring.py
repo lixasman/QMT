@@ -4,12 +4,16 @@ from typing import Mapping, Optional
 
 from core.enums import DataQuality
 
-from .constants import LAYER2_THRESHOLD, SCORE_WEIGHTS, VALID_SIGNAL_KEYS
+from .constants import SCORE_WEIGHTS, VALID_SIGNAL_KEYS
+from .exit_config import get_exit_layer2_threshold
 from .types import SoftScoreResult
 
 
 def compute_score_soft(
-    signals: Mapping[str, float], *, data_health: Optional[Mapping[str, DataQuality]] = None
+    signals: Mapping[str, float],
+    *,
+    data_health: Optional[Mapping[str, DataQuality]] = None,
+    threshold: float | None = None,
 ) -> SoftScoreResult:
     keys = set(signals.keys())
     illegal = keys - VALID_SIGNAL_KEYS
@@ -28,6 +32,6 @@ def compute_score_soft(
     score = round(float(raw), 2)
     if not (0.0 <= float(score) <= 2.3):
         raise AssertionError(f"Score_soft out of range: {score}")
-    triggered = bool(float(score) >= float(LAYER2_THRESHOLD))
+    gate = float(get_exit_layer2_threshold()) if threshold is None else float(threshold)
+    triggered = bool(float(score) >= float(gate))
     return SoftScoreResult(score_soft=float(score), triggered=triggered, used_signals=used)
-

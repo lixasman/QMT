@@ -10,7 +10,7 @@ from core.enums import OrderSide
 from core.interfaces import DataAdapter, OrderRequest, TradingAdapter
 from core.models import LockedOrder, PendingEntry, PortfolioState
 from core.state_manager import StateManager
-from core.warn_utils import warn_once
+from core.warn_utils import degrade_once, warn_once
 
 from .archiver import archive_near_miss, archive_signal_fired, archive_watchlist
 from .entry_logger import log_phase2_score, log_phase3_decision, log_phase3_rejected
@@ -22,6 +22,7 @@ ENTRY_MUTEX = threading.Lock()
 PRIORITY_T0 = 1
 PRIORITY_TRIAL = 2
 PRIORITY_PREEMPTION = 3
+TERMINAL_PENDING_ENTRY_STATUSES = {"FAILED", "CONFIRM_FILLED"}
 
 
 def _extract_order_id(o: Any) -> Optional[int]:
@@ -64,6 +65,52 @@ def _order_ids(raw_orders: list[Any]) -> set[int]:
     return out
 
 
+def _extract_position_code(p: Any) -> str:
+    if isinstance(p, dict):
+        for k in ("etf_code", "stock_code", "code", "symbol", "证券代码"):
+            v = p.get(k)
+            if v:
+                return str(v)
+        return ""
+    for k2 in ("etf_code", "stock_code", "code", "symbol"):
+        v2 = getattr(p, k2, None)
+        if v2:
+            return str(v2)
+    return ""
+
+
+def _extract_position_total(p: Any) -> int:
+    if isinstance(p, dict):
+        for k in ("total_qty", "volume", "qty", "position", "current_amount", "total_amount", "持仓", "持仓数量"):
+            v = p.get(k)
+            if v is None:
+                continue
+            try:
+                return int(v)
+            except Exception:
+                continue
+        return 0
+    for k2 in ("total_qty", "volume", "qty", "position", "current_amount", "total_amount"):
+        v2 = getattr(p, k2, None)
+        if v2 is None:
+            continue
+        try:
+            return int(v2)
+        except Exception:
+            continue
+    return 0
+
+
+def _position_totals(raw_positions: list[Any]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for p in raw_positions:
+        code = str(_extract_position_code(p) or "")
+        if not code:
+            continue
+        out[code] = int(_extract_position_total(p))
+    return out
+
+
 def _ensure_pending_entry_shape(pe: PendingEntry) -> None:
     if not pe.etf_code:
         raise AssertionError("pending entry missing etf_code")
@@ -103,13 +150,37 @@ class EntryFSM:
     def save(self) -> None:
         self._sm.save(self._state)
 
+    def _prune_terminal_pending_entries_locked(self, *, etf_code: str) -> bool:
+        code = str(etf_code or "")
+        before = len(self._state.pending_entries)
+        self._state.pending_entries = [
+            pe
+            for pe in self._state.pending_entries
+            if not (str(pe.etf_code or "") == code and str(pe.status or "") in TERMINAL_PENDING_ENTRY_STATUSES)
+        ]
+        return len(self._state.pending_entries) != before
+
+    def remove_pending_entry(self, *, pe: PendingEntry) -> bool:
+        with self._mutex:
+            before = len(self._state.pending_entries)
+            self._state.pending_entries = [cur for cur in self._state.pending_entries if cur is not pe]
+            changed = len(self._state.pending_entries) != before
+            if changed:
+                self.save()
+            return changed
+
     def upsert_watchlist(self, *, d: datetime, watchlist: list[WatchlistItem]) -> None:
         archive_watchlist(base_dir=self._archive_base_dir, d=d.date(), watchlist=watchlist)
 
     def record_phase2_result(self, *, timestamp: datetime, etf_code: str, watch: WatchlistItem, res: Phase2Result) -> None:
         diversity_gate = bool(res.signals.get("S_volume", 0.0) > 0.0 or res.signals.get("S_chip_pr", 0.0) > 0.0)
         decision = "SIGNAL_FIRED" if res.is_triggered else "NO_SIGNAL"
-        note = "强信号 ≥0.70" if res.is_strong else ""
+        notes: list[str] = []
+        if str(getattr(res, "note", "") or "").strip():
+            notes.append(str(getattr(res, "note", "")).strip())
+        if res.is_strong:
+            notes.append("强信号 ≥0.70")
+        note = "; ".join(notes)
         signals_for_log = dict(res.signals)
         signals_for_log.update(
             {
@@ -147,8 +218,11 @@ class EntryFSM:
 
     def add_pending_entry(self, *, fired: SignalFired) -> None:
         with self._mutex:
+            pruned = self._prune_terminal_pending_entries_locked(etf_code=fired.etf_code)
             for pe in self._state.pending_entries:
                 if pe.etf_code == fired.etf_code and pe.status != "FAILED":
+                    if pruned:
+                        self.save()
                     return
             pe = PendingEntry(
                 etf_code=fired.etf_code,
@@ -178,15 +252,69 @@ class EntryFSM:
         with self._mutex:
             raw_orders = self._trading.query_orders()
             alive = _order_ids(raw_orders)
+            try:
+                live_totals = _position_totals(list(self._trading.query_positions()))
+                positions_snapshot_ok = True
+            except Exception:
+                live_totals = {}
+                positions_snapshot_ok = False
+            kept_entries: list[PendingEntry] = []
 
             for pe in self._state.pending_entries:
                 _ensure_pending_entry_shape(pe)
+                code = str(getattr(pe, "etf_code", "") or "")
+                ps = self._state.positions.get(code)
+                local_total = int(getattr(ps, "total_qty", 0) or 0) if ps is not None else 0
+                live_total = int(live_totals.get(code, 0)) if bool(positions_snapshot_ok) else 0
+                if pe.status == "PENDING_CONFIRM":
+                    if bool(positions_snapshot_ok) and int(live_total) <= 0 and int(local_total) <= 0:
+                        degrade_once(
+                            f"entry_recover_drop_pending_confirm_without_trial:{code}",
+                            f"startup recovery marked pending confirm FAILED because no trial position exists. etf={code}",
+                        )
+                        pe.status = "FAILED"
+                        continue
                 if pe.status in ("TRIAL_PLACED", "CONFIRM_PLACED"):
                     oid = pe.trial_order_id if pe.status == "TRIAL_PLACED" else pe.confirm_order_id
                     if oid is None:
+                        if bool(positions_snapshot_ok) and int(live_total) > 0:
+                            if pe.status == "TRIAL_PLACED":
+                                pe.status = "PENDING_CONFIRM"
+                                kept_entries.append(pe)
+                                continue
+                            pe.status = "CONFIRM_FILLED"
+                            continue
+                        if not bool(positions_snapshot_ok):
+                            kept_entries.append(pe)
+                            continue
+                        degrade_once(
+                            f"entry_recover_missing_order_id:{str(pe.etf_code)}:{str(pe.status)}",
+                            f"startup recovery marked pending entry FAILED due to missing order id. etf={pe.etf_code} status={pe.status}",
+                        )
                         pe.status = "FAILED"
                     elif int(oid) not in alive:
+                        if bool(positions_snapshot_ok) and int(live_total) > 0:
+                            if pe.status == "TRIAL_PLACED":
+                                pe.status = "PENDING_CONFIRM"
+                                kept_entries.append(pe)
+                                continue
+                            degrade_once(
+                                f"entry_recover_confirm_filled:{str(pe.etf_code)}:{int(oid)}",
+                                f"startup recovery converted placed confirm entry to terminal filled because broker already shows position. etf={pe.etf_code} order_id={int(oid)}",
+                            )
+                            pe.status = "CONFIRM_FILLED"
+                            continue
+                        if not bool(positions_snapshot_ok):
+                            kept_entries.append(pe)
+                            continue
+                        degrade_once(
+                            f"entry_recover_order_not_alive:{str(pe.etf_code)}:{int(oid)}",
+                            f"startup recovery marked pending entry FAILED because order is not alive. etf={pe.etf_code} order_id={int(oid)}",
+                        )
                         pe.status = "FAILED"
+                kept_entries.append(pe)
+
+            self._state.pending_entries = kept_entries
 
             keep_locks = []
             released_any = False
@@ -194,6 +322,13 @@ class EntryFSM:
                 if int(lo.order_id) in alive:
                     keep_locks.append(lo)
                 else:
+                    degrade_once(
+                        f"entry_recover_release_lock:{int(lo.order_id)}",
+                        (
+                            "startup recovery released stale locked cash because order is missing in broker alive set. "
+                            f"order_id={int(lo.order_id)} etf={str(lo.etf_code)}"
+                        ),
+                    )
                     self._cash.release_cash(int(lo.order_id))
                     released_any = True
             if released_any:

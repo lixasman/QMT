@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Callable, Optional
 
 from .constants import TRADING_SESSIONS
+from .warn_utils import warn_once
 
 
 try:
@@ -34,6 +35,11 @@ def _default_calendar_provider(start_yyyymmdd: str, end_yyyymmdd: str) -> list[s
                 out.append(s[:8])
         return [x for x in out if len(x) == 8 and x.isdigit()]
 
+    warn_once(
+        "trading_calendar_weekday_fallback",
+        "TimeUtils: xtquant.xtdata unavailable, using weekday-only calendar fallback; exchange holidays may be misclassified.",
+        logger_name=__name__,
+    )
     s = datetime.strptime(start_yyyymmdd, "%Y%m%d").date()
     e = datetime.strptime(end_yyyymmdd, "%Y%m%d").date()
     out2: list[str] = []

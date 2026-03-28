@@ -7,8 +7,10 @@
 - 运行环境：MiniQMT / XtQuant 可用且已登录
 - Python 依赖：numpy / pandas / scipy（扩散与峰值检测依赖 SciPy）
 - 份额/成交量口径：
-  - tick 的 `volume` 单位为“股/份”
+  - XtData 返回的 `tick/1d volume` 单位为“手”
+  - 引擎内部统一换算为“股/份”（`volume * 100`）
   - tick 的 `amount/volume` 为日内累计，需要做差分得到窗口增量
+  - ETF 总份额优先使用交易所官方源（SSE/SZSE）；若官方源不可用会降级到 XtData，并输出 `[WARN]` 告警
 
 ## 输出指标
 
@@ -109,11 +111,31 @@ python -m etf_chip_engine.realtime --etf 560780.SH --seconds 12 --min-ticks 10 -
 - Trading day at/after `15:30` => `T`
 - Non-trading day => latest trading day
 - Daily batch pre-downloads tick data before running per-ETF chip computation.
+- Daily batch first applies a 1d-liquidity pre-filter, then pre-downloads tick data.
+- Symbols failing liquidity gates are skipped before tick download.
+- Default liquidity gates (balanced profile, configurable):
+- `liquidity_prefilter_lookback_days=60`
+- `liquidity_prefilter_min_active_days=45`
+- `liquidity_prefilter_min_median_amount=2000000.0`
+- `liquidity_prefilter_min_median_volume=0.0`
+- Stable compute pool is enabled by default:
+- pool state file: `output/cache/chip_compute_pool/stable_pool.json`
+- reused across days; auto-refresh every `30` days
+- Admission filter enabled by default (on top of name-keyword filtering):
+- ETFs with constituent count `> 200` are skipped (`industry_etf_max_constituents`).
+- ETFs with A-share constituent ratio `< 0.95` are skipped (`industry_etf_min_a_share_ratio`).
 - Same-day re-runs are deduplicated with a local state file:
 - `output/cache/chip_tick_download/tick_YYYYMMDD.json`
-- If a symbol still has empty tick data, the job auto-retries download once per code per day.
+- Same-day xtdata tick files are kept by default (no auto-delete after batch).
+- If you need old behavior, enable explicit cleanup with:
+- `python -m etf_chip_engine.daily_batch --date auto --cleanup-trade-date-tick`
+- If a symbol still has empty tick data, the job auto-retries download once per code per day, with hard timeout (`empty_tick_retry_timeout_sec`, default `20`) and immediate `[WARN]` alerts on timeout/failure.
+- IOPV fallback premium now uses a strict coverage gate (`premium_iopv_min_coverage`, default `0.95`):
+- coverage `>= 0.95`: directly use IOPV fallback premium.
+- coverage `< 0.95`: warn and downgrade premium to zeros for that ETF.
+- End-of-run summary always prints downgraded ETFs with code + name (`etf_chip_engine.service.iopv_coverage_downgrade_summary`).
 - Optional full refresh: `python -m etf_chip_engine.daily_batch --date auto --force-download`
-- Default retention cleanup keeps only last `365` days of dated files.
+- Default retention cleanup keeps only last `1095` calendar days of dated files.
 - Cleanup scope includes:
 - `etf_chip_engine/data/l1_snapshots/<YYYYMMDD>/`
 - `etf_chip_engine/data/chip_snapshots/*_<YYYYMMDD>.npz|.ema.json`

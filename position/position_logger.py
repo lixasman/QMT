@@ -1,17 +1,51 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import atexit
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, TextIO
+
+
+_JSONL_WRITERS: dict[str, TextIO] = {}
+_JSONL_WRITERS_LOCK = Lock()
+
+
+def _get_jsonl_writer(path: Path) -> TextIO:
+    cache_key = str(path.resolve())
+    writer = _JSONL_WRITERS.get(cache_key)
+    if writer is not None and not writer.closed:
+        return writer
+    with _JSONL_WRITERS_LOCK:
+        writer = _JSONL_WRITERS.get(cache_key)
+        if writer is not None and not writer.closed:
+            return writer
+        writer = path.open("a", encoding="utf-8", buffering=1)
+        _JSONL_WRITERS[cache_key] = writer
+        return writer
+
+
+def _close_jsonl_writers() -> None:
+    with _JSONL_WRITERS_LOCK:
+        writers = list(_JSONL_WRITERS.values())
+        _JSONL_WRITERS.clear()
+    for writer in writers:
+        writer.close()
 
 
 def append_jsonl(*, log_path: str, payload: dict[str, Any]) -> None:
+    if not str(log_path).strip():
+        return
     p = Path(str(log_path))
     p.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, ensure_ascii=False)
-    with p.open("a", encoding="utf-8") as f:
-        f.write(line + "\n")
+    writer = _get_jsonl_writer(p)
+    writer.write(line + "\n")
+    writer.flush()
+
+
+atexit.register(_close_jsonl_writers)
 
 
 def log_fsm_transition(*, log_path: str, timestamp: datetime, payload: dict[str, Any]) -> None:

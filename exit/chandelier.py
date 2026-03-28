@@ -4,7 +4,14 @@ from typing import Optional, Sequence
 
 from core.interfaces import Bar
 
-from .constants import ATR_PERIOD, K_CHIP_DECAY, K_NORMAL, K_REDUCED
+from .constants import ATR_PERIOD
+from .exit_config import (
+    get_exit_atr_pct_max,
+    get_exit_atr_pct_min,
+    get_exit_k_chip_decay,
+    get_exit_k_normal,
+    get_exit_k_reduced,
+)
 from .types import ChandelierState
 
 
@@ -41,15 +48,23 @@ def update_highest_high(prev_hh: float, bars: Sequence[Bar]) -> float:
     return float(hh)
 
 
-def choose_k(*, reduced: bool, s_chip: float) -> float:
+def choose_k(
+    *,
+    reduced: bool,
+    s_chip: float,
+    k_normal: float | None = None,
+    k_chip_decay: float | None = None,
+    k_reduced: float | None = None,
+) -> float:
+    normal = float(get_exit_k_normal()) if k_normal is None else float(k_normal)
+    chip_decay = float(get_exit_k_chip_decay()) if k_chip_decay is None else float(k_chip_decay)
+    reduced_k = float(get_exit_k_reduced()) if k_reduced is None else float(k_reduced)
     if bool(reduced):
-        k = float(K_REDUCED)
+        k = float(reduced_k)
     else:
-        k = float(K_CHIP_DECAY) if float(s_chip) >= 0.3 else float(K_NORMAL)
-    if float(k) not in (float(K_NORMAL), float(K_CHIP_DECAY), float(K_REDUCED)):
+        k = float(chip_decay) if float(s_chip) >= 0.3 else float(normal)
+    if float(k) <= 0:
         raise AssertionError(f"k invalid: {k}")
-    if bool(reduced) and float(k) != float(K_REDUCED):
-        raise AssertionError(f"reduced but k={k}, expect {K_REDUCED}")
     return float(k)
 
 
@@ -60,10 +75,29 @@ def compute_chandelier_state(
     reduced: bool,
     s_chip: float,
     prev_k: Optional[float] = None,
+    atr_pct_min: float | None = None,
+    atr_pct_max: float | None = None,
+    k_normal: float | None = None,
+    k_chip_decay: float | None = None,
+    k_reduced: float | None = None,
 ) -> ChandelierState:
     hh = update_highest_high(float(prev_hh), bars)
     atr = compute_atr_wilder(bars, period=int(ATR_PERIOD))
-    k = choose_k(reduced=bool(reduced), s_chip=float(s_chip))
+    close_ref = float(bars[-1].close) if bars else 0.0
+    if close_ref > 0:
+        min_pct = get_exit_atr_pct_min() if atr_pct_min is None else float(atr_pct_min)
+        max_pct = get_exit_atr_pct_max() if atr_pct_max is None else float(atr_pct_max)
+        if min_pct is not None and float(min_pct) > 0:
+            atr = max(float(atr), float(min_pct) * float(close_ref))
+        if max_pct is not None and float(max_pct) > 0:
+            atr = min(float(atr), float(max_pct) * float(close_ref))
+    k = choose_k(
+        reduced=bool(reduced),
+        s_chip=float(s_chip),
+        k_normal=k_normal,
+        k_chip_decay=k_chip_decay,
+        k_reduced=k_reduced,
+    )
     if prev_k is not None and float(k) > float(prev_k):
         raise AssertionError(f"k increased: prev={prev_k} now={k}")
     stop = float(hh) - float(k) * float(atr)

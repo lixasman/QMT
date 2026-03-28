@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 from ..enums import OrderStatus
 from ..interfaces import OrderRequest, OrderResult, TradingAdapter
+from ..warn_utils import degrade_once
 
 
 class XtTradingAdapter(TradingAdapter):
@@ -193,17 +194,26 @@ class XtTradingAdapter(TradingAdapter):
         while time.time() - t0 <= float(timeout_s):
             orders = self.query_orders()
             for o in orders:
-                if int(getattr(o, "order_id", 0) or 0) == oid:
-                    last = o
-                    st = str(getattr(o, "status", "") or "").upper()
-                    if "FILLED" in st or "DONE" in st or "成交" in st:
-                        return OrderResult(order_id=oid, status=OrderStatus.FILLED, raw=o)
-                    if "CANCEL" in st or "撤" in st:
-                        return OrderResult(order_id=oid, status=OrderStatus.CANCELED, raw=o)
-                    if "REJECT" in st or "废" in st:
-                        return OrderResult(order_id=oid, status=OrderStatus.REJECTED, raw=o)
-                    break
+                if int(getattr(o, "order_id", 0) or 0) != oid:
+                    continue
+                last = o
+                st = str(getattr(o, "status", "") or "").upper()
+                if "FILLED" in st or "DONE" in st or "成交" in st:
+                    return OrderResult(order_id=oid, status=OrderStatus.FILLED, raw=o)
+                if "CANCEL" in st or "撤" in st:
+                    return OrderResult(order_id=oid, status=OrderStatus.CANCELED, raw=o)
+                if "REJECT" in st or "拒" in st:
+                    return OrderResult(order_id=oid, status=OrderStatus.REJECTED, raw=o)
+                degrade_once(
+                    f"xt_confirm_unparsed_status:{int(oid)}",
+                    f"XT confirm_order cannot map broker status; waiting timeout fallback. order_id={int(oid)} raw_status={st}",
+                )
+                break
             time.sleep(0.2)
+        degrade_once(
+            f"xt_confirm_timeout:{int(oid)}",
+            f"XT confirm_order timeout; returning UNKNOWN. order_id={int(oid)} timeout_s={float(timeout_s)}",
+        )
         return OrderResult(order_id=oid, status=OrderStatus.UNKNOWN, raw=last, error="confirm timeout")
 
     def force_reconcile(self) -> dict[str, Any]:

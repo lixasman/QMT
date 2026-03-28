@@ -1,8 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
+import re
 import time
 from typing import Any, Optional
 
@@ -15,13 +18,17 @@ from etf_chip_engine.data.tick_adapter import ticks_to_snapshots
 from etf_chip_engine.data.xtdata_provider import (
     calc_atr_10,
     ensure_tick_data_downloaded,
+    ensure_daily_history_downloaded,
     filter_etf_codes_by_keywords,
+    filter_etf_codes_by_liquidity,
     get_daily_bars,
+    download_constituent_close_prices,
     get_etf_info,
     get_industry_etf_universe,
     get_local_tick_data,
     get_market_tick_data,
     get_total_shares,
+    get_total_shares_detail,
     prev_trade_date,
     retry_download_for_empty_tick_code_once,
 )
@@ -106,12 +113,298 @@ def _warn_runtime_once(key: str, msg: str) -> None:
     print(f"[WARN] {msg}", flush=True)
 
 
+def _as_bool(v: Any, *, default: bool = False) -> bool:
+    if v is None:
+        return bool(default)
+    if isinstance(v, bool):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _trade_date_from_any(v: Any) -> str:
+    m = re.search(r"(\d{8})", str(v or ""))
+    return m.group(1) if m else ""
+
+
+def _build_trade_date_bar_from_snapshots(snapshots: pd.DataFrame, *, trade_date: str) -> pd.DataFrame:
+    base_cols = ["time", "open", "high", "low", "close", "volume", "amount"]
+    if snapshots is None or snapshots.empty:
+        return pd.DataFrame(columns=base_cols)
+    required = {"close", "high", "low", "volume", "amount"}
+    if not required.issubset(snapshots.columns):
+        return pd.DataFrame(columns=base_cols)
+
+    close = pd.to_numeric(snapshots["close"], errors="coerce")
+    valid = close.gt(0)
+    if int(valid.sum()) <= 0:
+        return pd.DataFrame(columns=base_cols)
+
+    df = snapshots.loc[valid].reset_index(drop=True)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    amount = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    high_v = float(pd.concat([high, close], axis=1).max(axis=1).max())
+    low_v = float(pd.concat([low, close], axis=1).min(axis=1).min())
+    row = {
+        "time": str(trade_date),
+        "open": float(close.iloc[0]),
+        "high": high_v,
+        "low": low_v,
+        "close": float(close.iloc[-1]),
+        "volume": float(volume.sum()),
+        "amount": float(amount.sum()),
+    }
+    return pd.DataFrame([row], columns=base_cols)
+
+
+def _ensure_trade_date_daily_bar(daily_df: pd.DataFrame, *, trade_date: str, snapshots: pd.DataFrame) -> pd.DataFrame:
+    base = daily_df.copy() if daily_df is not None and not daily_df.empty else pd.DataFrame()
+    last_td = _trade_date_from_any(base["time"].iloc[-1]) if (not base.empty and "time" in base.columns) else ""
+    if last_td == str(trade_date):
+        return base.reset_index(drop=True)
+
+    trade_bar = _build_trade_date_bar_from_snapshots(snapshots, trade_date=str(trade_date))
+    if trade_bar.empty:
+        return base.reset_index(drop=True)
+    if base.empty:
+        return trade_bar.reset_index(drop=True)
+
+    if "time" in base.columns:
+        keep_mask = base["time"].map(_trade_date_from_any) != str(trade_date)
+        base = base.loc[keep_mask].reset_index(drop=True)
+    return pd.concat([base, trade_bar], ignore_index=True)
+
+
+def _history_before_trade_date(daily_df: pd.DataFrame, *, trade_date: str, keep_count: int) -> pd.DataFrame:
+    base = daily_df.copy() if daily_df is not None and not daily_df.empty else pd.DataFrame()
+    if base.empty:
+        return base.reset_index(drop=True)
+    if "time" in base.columns:
+        keep_mask = base["time"].map(_trade_date_from_any) != str(trade_date)
+        base = base.loc[keep_mask].reset_index(drop=True)
+    keep_n = max(int(keep_count), 0)
+    if keep_n > 0 and len(base) > keep_n:
+        base = base.tail(keep_n).reset_index(drop=True)
+    return base.reset_index(drop=True)
+
+
+def _load_daily_history_before_trade_date(
+    *,
+    code: str,
+    trade_date: str,
+    count: int,
+    expected_last_trade_date: str = "",
+    context: str,
+) -> pd.DataFrame:
+    keep_n = max(int(count), 0)
+    query_count = keep_n + 1 if keep_n > 0 else 1
+    daily_df = get_daily_bars([code], end_time=trade_date, count=query_count)
+    hist = _history_before_trade_date(daily_df, trade_date=trade_date, keep_count=keep_n)
+    expected_td = str(expected_last_trade_date or "").strip()
+    if expected_td:
+        last_td = _trade_date_from_any(hist["time"].iloc[-1]) if (not hist.empty and "time" in hist.columns) else ""
+        if last_td != expected_td:
+            timeout_sec = int(CONFIG.get("daily_history_download_timeout_sec", 20) or 20)
+            poll_attempts = max(int(CONFIG.get("daily_history_download_poll_attempts", 4) or 4), 1)
+            poll_sleep_sec = float(CONFIG.get("daily_history_download_poll_sleep_sec", 0.5) or 0.5)
+            try:
+                ensure_daily_history_downloaded([code], expected_td, timeout_sec=timeout_sec)
+            except Exception as e:
+                _warn_runtime_once(
+                    f"daily_history_auto_download_failed:{expected_td}:{code}",
+                    (
+                        "ETF: stale daily history auto-download failed."
+                        f" code={code} target_date={expected_td} context={context}"
+                        f" err={repr(e)}"
+                        ),
+                    )
+            for attempt in range(poll_attempts):
+                if attempt > 0:
+                    time.sleep(max(poll_sleep_sec, 0.0))
+                daily_df = get_daily_bars([code], end_time=trade_date, count=query_count)
+                hist = _history_before_trade_date(daily_df, trade_date=trade_date, keep_count=keep_n)
+                last_td = _trade_date_from_any(hist["time"].iloc[-1]) if (not hist.empty and "time" in hist.columns) else ""
+                if last_td == expected_td:
+                    break
+        if last_td != expected_td:
+            raise RuntimeError(
+                f"stale daily history: context={context} trade_date={trade_date}"
+                f" expected_last={expected_td} last_daily={last_td or 'missing'}"
+            )
+    return hist
+
+
+def _assert_trade_date_bar_fresh(daily_df: pd.DataFrame, *, trade_date: str, context: str) -> None:
+    last_td = _trade_date_from_any(daily_df["time"].iloc[-1]) if (daily_df is not None and not daily_df.empty and "time" in daily_df.columns) else ""
+    if last_td != str(trade_date):
+        raise RuntimeError(
+            f"stale daily bar: context={context} trade_date={trade_date} last_daily={last_td or 'missing'}"
+        )
+
+
+def _load_trade_date_daily_bars(
+    *,
+    code: str,
+    trade_date: str,
+    count: int,
+    snapshots: pd.DataFrame,
+    context: str,
+) -> pd.DataFrame:
+    query_count = max(int(count), 1)
+    daily_df = get_daily_bars([code], end_time=trade_date, count=query_count)
+    effective = _ensure_trade_date_daily_bar(daily_df, trade_date=trade_date, snapshots=snapshots)
+    last_td = _trade_date_from_any(effective["time"].iloc[-1]) if (effective is not None and not effective.empty and "time" in effective.columns) else ""
+    if last_td != str(trade_date):
+        timeout_sec = int(CONFIG.get("daily_history_download_timeout_sec", 20) or 20)
+        poll_attempts = max(int(CONFIG.get("daily_history_download_poll_attempts", 4) or 4), 1)
+        poll_sleep_sec = float(CONFIG.get("daily_history_download_poll_sleep_sec", 0.5) or 0.5)
+        try:
+            ensure_daily_history_downloaded([code], trade_date, timeout_sec=timeout_sec)
+        except Exception as e:
+            _warn_runtime_once(
+                f"daily_bar_auto_download_failed:{trade_date}:{code}",
+                (
+                    "ETF: stale daily bar auto-download failed."
+                    f" code={code} target_date={trade_date} context={context}"
+                    f" err={repr(e)}"
+                ),
+            )
+        for attempt in range(poll_attempts):
+            if attempt > 0:
+                time.sleep(max(poll_sleep_sec, 0.0))
+            daily_df = get_daily_bars([code], end_time=trade_date, count=query_count)
+            effective = _ensure_trade_date_daily_bar(daily_df, trade_date=trade_date, snapshots=snapshots)
+            last_td = _trade_date_from_any(effective["time"].iloc[-1]) if (effective is not None and not effective.empty and "time" in effective.columns) else ""
+            if last_td == str(trade_date):
+                break
+    if last_td != str(trade_date):
+        raise RuntimeError(
+            f"stale daily bar: context={context} trade_date={trade_date} last_daily={last_td or 'missing'}"
+        )
+    return effective
+
+
+def _compute_adv_60(*, code: str, trade_date: str, prev_trade_date: str) -> Optional[float]:
+    try:
+        hist_bars = _load_daily_history_before_trade_date(
+            code=code,
+            trade_date=trade_date,
+            count=60,
+            expected_last_trade_date=str(prev_trade_date or ""),
+            context=f"etf:{code}:adv60",
+        )
+    except RuntimeError as e:
+        _warn_runtime_once(
+            f"etf_adv60_history_stale:{trade_date}:{code}",
+            f"ETF: ADV60 daily history stale, fallback disabled. code={code} date={trade_date} err={e}",
+        )
+        return None
+    except Exception:
+        return None
+
+    if hist_bars is None or hist_bars.empty:
+        return None
+    vol_col = hist_bars["volume"] if "volume" in hist_bars.columns else hist_bars.get("vol")
+    if vol_col is None or len(vol_col) <= 0:
+        return None
+    try:
+        return float(pd.to_numeric(vol_col, errors="coerce").dropna().mean())
+    except Exception:
+        return None
+
+
+def _normalize_codes(codes: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for c in codes:
+        s = str(c or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _extract_etf_name_from_info(info: Any) -> str:
+    if not isinstance(info, dict):
+        return ""
+    for key in ("name", "etf_name", "instrument_name", "InstrumentName"):
+        v = info.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _codes_scope_id(codes: list[str]) -> str:
+    norm = _normalize_codes(codes)
+    payload = ",".join(sorted(norm)).encode("utf-8", errors="ignore")
+    return hashlib.sha1(payload).hexdigest()
+
+
+def _parse_yyyymmdd(v: str) -> Optional[datetime]:
+    s = str(v or "").strip()
+    if len(s) != 8 or not s.isdigit():
+        return None
+    try:
+        return datetime.strptime(s, "%Y%m%d")
+    except Exception:
+        return None
+
+
+def _trade_date_age_days(*, built_trade_date: str, current_trade_date: str) -> Optional[int]:
+    d0 = _parse_yyyymmdd(built_trade_date)
+    d1 = _parse_yyyymmdd(current_trade_date)
+    if d0 is None or d1 is None:
+        return None
+    return int((d1.date() - d0.date()).days)
+
+
+def _liquidity_rules_from_config(cfg: dict[str, object]) -> dict[str, Any]:
+    return {
+        "lookback_days": int(cfg.get("liquidity_prefilter_lookback_days", 60)),
+        "min_active_days": int(cfg.get("liquidity_prefilter_min_active_days", 45)),
+        "min_median_amount": float(cfg.get("liquidity_prefilter_min_median_amount", 2_000_000.0)),
+        "min_median_volume": float(cfg.get("liquidity_prefilter_min_median_volume", 0.0)),
+        "chunk_size": int(cfg.get("liquidity_prefilter_chunk_size", 400)),
+    }
+
+
+def _load_stable_pool_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_stable_pool_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        json.dump(state, f, ensure_ascii=False, separators=(",", ":"))
+    tmp.replace(path)
+
+
 def _resolve_premium_rates(
     *,
     code: str,
     trade_date: str,
     snapshots: pd.DataFrame,
     engine: ETFChipEngine,
+    min_iopv_coverage: float = 0.95,
+    etf_name: str = "",
+    iopv_coverage_downgrade_sink: Optional[list[dict[str, Any]]] = None,
 ) -> Optional[pd.Series]:
     if snapshots is None or snapshots.empty:
         return None
@@ -166,21 +459,55 @@ def _resolve_premium_rates(
         )
         return None
 
+    coverage = float("nan")
     try:
         coverage = float(calc.get_coverage())
     except Exception as e:
         _warn_runtime_once(
             f"iopv_coverage_failed:{trade_date}:{code}",
-            f"IOPV: failed to read coverage, using 1.0. code={code} date={trade_date} err={repr(e)}",
+            f"IOPV: failed to read coverage, downgraded. code={code} date={trade_date} err={repr(e)}",
         )
-        coverage = 1.0
-    scale = float(coverage) if np.isfinite(coverage) and coverage > 0 else 1.0
+
+    coverage_threshold = float(min(max(float(min_iopv_coverage), 0.0), 1.0))
+    if not np.isfinite(coverage):
+        if iopv_coverage_downgrade_sink is not None:
+            iopv_coverage_downgrade_sink.append(
+                {
+                    "code": str(code),
+                    "name": str(etf_name or ""),
+                    "coverage": None,
+                    "threshold": float(coverage_threshold),
+                    "reason": "coverage_unavailable",
+                }
+            )
+        return pd.Series(np.zeros(len(snapshots), dtype=np.float64), index=snapshots.index)
+
+    if coverage < coverage_threshold:
+        _warn_runtime_once(
+            f"iopv_coverage_below_threshold:{trade_date}:{code}",
+            (
+                "IOPV: coverage below threshold, premium_rate downgraded to zeros."
+                f" code={code} name={etf_name or '-'} date={trade_date}"
+                f" coverage={coverage:.4f} threshold={coverage_threshold:.4f}"
+            ),
+        )
+        if iopv_coverage_downgrade_sink is not None:
+            iopv_coverage_downgrade_sink.append(
+                {
+                    "code": str(code),
+                    "name": str(etf_name or ""),
+                    "coverage": round(float(coverage), 6),
+                    "threshold": float(coverage_threshold),
+                    "reason": "coverage_below_threshold",
+                }
+            )
+        return pd.Series(np.zeros(len(snapshots), dtype=np.float64), index=snapshots.index)
 
     closes = pd.to_numeric(snapshots["close"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)
-    prem = ((closes - iopv_v) / iopv_v) * scale
+    prem = (closes - iopv_v) / iopv_v
     _warn_runtime_once(
         f"premium_rate_fallback_iopv:{trade_date}:{code}",
-        f"Micro: using IOPV fallback premium_rate. code={code} date={trade_date} iopv={iopv_v:.6f} coverage={scale:.4f}",
+        f"Micro: using IOPV fallback premium_rate. code={code} date={trade_date} iopv={iopv_v:.6f} coverage={coverage:.4f}",
     )
     return pd.Series(prem, index=snapshots.index)
 
@@ -199,6 +526,7 @@ class IndustryETFChipService:
         codes: Optional[list[str]] = None,
         force_download: bool = False,
     ) -> pd.DataFrame:
+        code_name_map: dict[str, str] = {}
         if codes is not None:
             codes_from_input = True
             codes = [str(c).strip() for c in codes if str(c).strip()]
@@ -206,6 +534,12 @@ class IndustryETFChipService:
             codes_from_input = False
             df_univ = get_industry_etf_universe()
             codes = df_univ["code"].astype(str).tolist()
+            if "name" in df_univ.columns:
+                for code_v, name_v in zip(df_univ["code"].astype(str).tolist(), df_univ["name"].astype(str).tolist()):
+                    code_k = str(code_v).strip().upper()
+                    name_k = str(name_v).strip()
+                    if code_k and name_k:
+                        code_name_map[code_k] = name_k
         if limit is not None:
             codes = codes[: max(int(limit), 0)]
         if codes_from_input and codes:
@@ -226,13 +560,271 @@ class IndustryETFChipService:
                     flush=True,
                 )
 
+        liq_prefilter_enabled = _as_bool(self.config.get("liquidity_prefilter_enabled", True), default=True)
+        if liq_prefilter_enabled and codes:
+            liq_rules = _liquidity_rules_from_config(self.config)
+            stable_pool_enabled = _as_bool(
+                self.config.get("liquidity_prefilter_stable_pool_enabled", True),
+                default=True,
+            )
+            refresh_days = max(int(self.config.get("liquidity_prefilter_pool_refresh_days", 30)), 1)
+            state_path = Path(
+                str(
+                    self.config.get(
+                        "liquidity_prefilter_pool_state_path",
+                        Path("output") / "cache" / "chip_compute_pool" / "stable_pool.json",
+                    )
+                )
+            )
+            scope_id = _codes_scope_id(codes)
+
+            liq_stats: dict[str, Any]
+            if stable_pool_enabled:
+                state = _load_stable_pool_state(state_path)
+                can_reuse = False
+                reuse_reason = "state_invalid"
+                age_days: Optional[int] = None
+                try:
+                    state_scope = str(state.get("scope_id", ""))
+                    state_rules = state.get("rules", {})
+                    state_codes = _normalize_codes(state.get("kept_codes", []))
+                    state_trade_date = str(state.get("trade_date", ""))
+                    age_days = _trade_date_age_days(built_trade_date=state_trade_date, current_trade_date=str(trade_date))
+                    if (
+                        state_scope == scope_id
+                        and isinstance(state_rules, dict)
+                        and state_rules == liq_rules
+                        and len(state_codes) > 0
+                        and age_days is not None
+                        and age_days >= 0
+                        and age_days <= refresh_days
+                    ):
+                        can_reuse = True
+                        reuse_reason = "within_refresh_window"
+                except Exception:
+                    can_reuse = False
+                    reuse_reason = "state_parse_failed"
+
+                if can_reuse:
+                    kept_set = set(_normalize_codes(state.get("kept_codes", [])))
+                    src_codes = _normalize_codes(codes)
+                    kept_codes = [c for c in src_codes if c in kept_set]
+                    removed_codes = [c for c in src_codes if c not in kept_set]
+                    liq_stats = {
+                        "mode": "stable_reuse",
+                        "reason": reuse_reason,
+                        "trade_date": str(trade_date),
+                        "state_path": str(state_path),
+                        "state_trade_date": str(state.get("trade_date", "")),
+                        "state_updated_at": str(state.get("updated_at", "")),
+                        "refresh_days": int(refresh_days),
+                        "age_days": (int(age_days) if age_days is not None else None),
+                        "input_count": int(len(src_codes)),
+                        "kept_count": int(len(kept_codes)),
+                        "removed_count": int(len(removed_codes)),
+                        "fallback_kept_count": 0,
+                        "failed_chunks": 0,
+                        **liq_rules,
+                        "kept_codes": kept_codes,
+                        "removed_codes": removed_codes,
+                        "removed_samples": [{"code": c} for c in removed_codes[:12]],
+                    }
+                else:
+                    liq_stats = filter_etf_codes_by_liquidity(
+                        codes,
+                        trade_date=trade_date,
+                        lookback_days=int(liq_rules["lookback_days"]),
+                        min_active_days=int(liq_rules["min_active_days"]),
+                        min_median_amount=float(liq_rules["min_median_amount"]),
+                        min_median_volume=float(liq_rules["min_median_volume"]),
+                        chunk_size=int(liq_rules["chunk_size"]),
+                    )
+                    liq_stats["mode"] = "stable_rebuild"
+                    liq_stats["reason"] = reuse_reason
+                    liq_stats["state_path"] = str(state_path)
+                    liq_stats["refresh_days"] = int(refresh_days)
+                    liq_stats["age_days"] = (int(age_days) if age_days is not None else None)
+                    try:
+                        state_payload = {
+                            "version": 1,
+                            "trade_date": str(trade_date),
+                            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                            "scope_id": scope_id,
+                            "refresh_days": int(refresh_days),
+                            "rules": liq_rules,
+                            "kept_codes": _normalize_codes(liq_stats.get("kept_codes", [])),
+                        }
+                        _save_stable_pool_state(state_path, state_payload)
+                    except Exception as e:
+                        _warn_runtime_once(
+                            f"liquidity_stable_pool_save_failed:{trade_date}",
+                            (
+                                "Liquidity prefilter: stable pool state 保存失败，已降级继续。"
+                                f" path={state_path} err={repr(e)}"
+                            ),
+                        )
+            else:
+                liq_stats = filter_etf_codes_by_liquidity(
+                    codes,
+                    trade_date=trade_date,
+                    lookback_days=int(liq_rules["lookback_days"]),
+                    min_active_days=int(liq_rules["min_active_days"]),
+                    min_median_amount=float(liq_rules["min_median_amount"]),
+                    min_median_volume=float(liq_rules["min_median_volume"]),
+                    chunk_size=int(liq_rules["chunk_size"]),
+                )
+                liq_stats["mode"] = "dynamic"
+                liq_stats["reason"] = "stable_pool_disabled"
+                liq_stats["state_path"] = ""
+                liq_stats["refresh_days"] = 0
+                liq_stats["age_days"] = None
+
+            codes = [str(c) for c in liq_stats.get("kept_codes", []) if str(c).strip()]
+            print(
+                json.dumps(
+                    {
+                        "timing": "etf_chip_engine.service.code_liquidity_filter",
+                        "mode": str(liq_stats.get("mode", "")),
+                        "reason": str(liq_stats.get("reason", "")),
+                        "trade_date": str(trade_date),
+                        "input_count": int(liq_stats.get("input_count", 0)),
+                        "kept_count": int(liq_stats.get("kept_count", 0)),
+                        "removed_count": int(liq_stats.get("removed_count", 0)),
+                        "fallback_kept_count": int(liq_stats.get("fallback_kept_count", 0)),
+                        "failed_chunks": int(liq_stats.get("failed_chunks", 0)),
+                        "lookback_days": int(liq_stats.get("lookback_days", 0)),
+                        "min_active_days": int(liq_stats.get("min_active_days", 0)),
+                        "min_median_amount": float(liq_stats.get("min_median_amount", 0.0)),
+                        "min_median_volume": float(liq_stats.get("min_median_volume", 0.0)),
+                        "state_path": str(liq_stats.get("state_path", "")),
+                        "refresh_days": int(liq_stats.get("refresh_days", 0)),
+                        "age_days": liq_stats.get("age_days"),
+                        "sample_removed": liq_stats.get("removed_samples", []),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+
+        etf_info_cache: dict[str, dict[str, Any]] = {}
+        max_constituents = int(self.config.get("industry_etf_max_constituents", 200))
+        min_a_share_ratio = float(self.config.get("industry_etf_min_a_share_ratio", 0.95))
+        min_a_share_ratio = float(min(max(min_a_share_ratio, 0.0), 1.0))
+        if (max_constituents > 0 or min_a_share_ratio > 0) and codes:
+            kept_codes: list[str] = []
+            removed_by_constituents = 0
+            removed_by_a_share_ratio = 0
+            unresolved_constituents = 0
+            for etf_code in codes:
+                try:
+                    info = get_etf_info(etf_code)
+                except Exception as e:
+                    _warn_runtime_once(
+                        f"get_etf_info_failed_admission:{trade_date}:{etf_code}",
+                        (
+                            "XtData: get_etf_info failed in admission filter, keep code by default."
+                            f" code={etf_code} date={trade_date} err={repr(e)}"
+                        ),
+                    )
+                    info = {}
+                etf_info_cache[etf_code] = info if isinstance(info, dict) else {}
+
+                stocks_dict = info.get("stocks") if isinstance(info, dict) else None
+                if not isinstance(stocks_dict, dict) or not stocks_dict:
+                    unresolved_constituents += 1
+                    kept_codes.append(etf_code)
+                    continue
+
+                constituent_count = 0
+                a_share_count = 0
+                for k, v in stocks_dict.items():
+                    if not isinstance(k, str) or not isinstance(v, dict):
+                        continue
+                    constituent_count += 1
+                    ku = str(k).upper()
+                    if ku.endswith((".SH", ".SZ", ".BJ")):
+                        a_share_count += 1
+
+                if constituent_count <= 0:
+                    unresolved_constituents += 1
+                    kept_codes.append(etf_code)
+                    continue
+
+                if max_constituents > 0 and constituent_count > max_constituents:
+                    removed_by_constituents += 1
+                    print(
+                        json.dumps(
+                            {
+                                "timing": "etf_chip_engine.service.admission_filter_skip",
+                                "trade_date": str(trade_date),
+                                "code": str(etf_code),
+                                "reason": "constituent_count_exceed",
+                                "constituent_count": int(constituent_count),
+                                "max_constituents": int(max_constituents),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    continue
+
+                a_share_ratio = float(a_share_count) / float(max(constituent_count, 1))
+                if min_a_share_ratio > 0 and a_share_ratio < min_a_share_ratio:
+                    removed_by_a_share_ratio += 1
+                    non_a_share_count = max(constituent_count - a_share_count, 0)
+                    print(
+                        json.dumps(
+                            {
+                                "timing": "etf_chip_engine.service.admission_filter_skip",
+                                "trade_date": str(trade_date),
+                                "code": str(etf_code),
+                                "reason": "a_share_ratio_low",
+                                "constituent_count": int(constituent_count),
+                                "a_share_count": int(a_share_count),
+                                "non_a_share_count": int(non_a_share_count),
+                                "a_share_ratio": round(float(a_share_ratio), 6),
+                                "min_a_share_ratio": round(float(min_a_share_ratio), 6),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
+                    continue
+
+                kept_codes.append(etf_code)
+
+            if removed_by_constituents > 0 or removed_by_a_share_ratio > 0 or unresolved_constituents > 0:
+                print(
+                    json.dumps(
+                        {
+                            "timing": "etf_chip_engine.service.admission_filter_summary",
+                            "trade_date": str(trade_date),
+                            "input_count": int(len(codes)),
+                            "kept_count": int(len(kept_codes)),
+                            "removed_by_constituents": int(removed_by_constituents),
+                            "removed_by_a_share_ratio": int(removed_by_a_share_ratio),
+                            "unresolved_constituents": int(unresolved_constituents),
+                            "max_constituents": int(max_constituents),
+                            "min_a_share_ratio": round(float(min_a_share_ratio), 6),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+
+            codes = kept_codes
+
         total_codes = len(codes)
+        min_iopv_coverage = float(
+            min(max(float(self.config.get("premium_iopv_min_coverage", 0.95)), 0.0), 1.0)
+        )
+        iopv_coverage_downgraded: list[dict[str, Any]] = []
         print(f"trade_date={trade_date} universe={total_codes}", flush=True)
         download_stats = ensure_tick_data_downloaded(
             codes,
             trade_date,
             force=bool(force_download),
-            chunk_size=int(self.config.get("tick_download_chunk_size", 200)),
+            chunk_size=int(self.config.get("tick_download_chunk_size", 80)),
             timeout_sec=int(self.config.get("tick_download_chunk_timeout_sec", 45)),
         )
         print(
@@ -262,25 +854,82 @@ class IndustryETFChipService:
                 parquet_ok = False
 
         prev_date = prev_trade_date(trade_date)
+        if not str(prev_date).strip():
+            _warn_runtime_once(
+                f"prev_trade_date_unavailable:{trade_date}",
+                f"Chip: 无法解析前一交易日，当前批次将按冷启动处理。trade_date={trade_date}",
+            )
         results: list[dict[str, Any]] = []
         skipped = 0
+        prev_state_loaded = 0
+        prev_state_missing = 0
+        prev_state_load_failed = 0
+        prev_date_unavailable = 0
+        _constituent_px_cache: dict[str, float] = {}  # 跨 ETF 共享成分股收盘价缓存
         progress = _BatchProgress(
             total_codes,
             update_interval_sec=float(self.config.get("progress_update_sec", 0.5)),
         )
 
+        def _cold_start_from_daily(etf_code: str) -> None:
+            daily_df = _load_daily_history_before_trade_date(
+                code=etf_code,
+                trade_date=trade_date,
+                count=int(self.config.get("cold_start_lookback", 60)),
+                expected_last_trade_date=str(prev_date or ""),
+                context=f"etf:{etf_code}:cold_start",
+            )
+            cs_detail = get_total_shares_detail(etf_code, trade_date=trade_date)
+            cs_shares = float(cs_detail.get("shares", 0.0))
+            cs_source = str(cs_detail.get("source", "none"))
+            if not cs_source.startswith("official_"):
+                _warn_runtime_once(
+                    f"shares_source_fallback_cold_start:{trade_date}:{etf_code}",
+                    (
+                        "Shares: 官方份额不可用，冷启动已降级。"
+                        f" code={etf_code} date={trade_date} source={cs_source}"
+                        f" reason={cs_detail.get('reason', '')}"
+                    ),
+                )
+            cs_atr = calc_atr_10(daily_df) if daily_df is not None and not daily_df.empty else 0.0
+            engine.cold_start(etf_code, daily_df, total_shares=cs_shares, atr=cs_atr)
+
         for idx, code in enumerate(codes, start=1):
+            loaded_prev_state = False
             prev_state = chip_dir / f"{code.replace('.', '_')}_{prev_date}.npz" if prev_date else None
-            if prev_state is not None and prev_state.exists():
-                engine.load_state(code, str(prev_state))
+            if prev_date and prev_state is not None and prev_state.exists():
+                try:
+                    engine.load_state(code, str(prev_state))
+                    loaded_prev_state = True
+                    prev_state_loaded += 1
+                except Exception as e:
+                    prev_state_load_failed += 1
+                    _warn_runtime_once(
+                        f"prev_state_load_failed:{trade_date}:{code}",
+                        (
+                            "Chip: 读取前一交易日状态失败，已降级冷启动。"
+                            f" code={code} date={trade_date} prev_date={prev_date}"
+                            f" state={prev_state} err={repr(e)}"
+                        ),
+                    )
+                    _cold_start_from_daily(code)
             else:
-                daily_df = get_daily_bars([code], end_time=trade_date, count=int(self.config.get("cold_start_lookback", 60)))
-                cs_shares = get_total_shares(code)
-                cs_atr = calc_atr_10(daily_df) if daily_df is not None and not daily_df.empty else 0.0
-                engine.cold_start(code, daily_df, total_shares=cs_shares, atr=cs_atr)
+                if prev_date:
+                    prev_state_missing += 1
+                    _warn_runtime_once(
+                        f"prev_state_missing:{trade_date}",
+                        (
+                            "Chip: 前一交易日状态文件缺失，已降级冷启动。"
+                            f" date={trade_date} prev_date={prev_date}"
+                            f" first_code={code} expected_state={prev_state}"
+                        ),
+                    )
+                else:
+                    prev_date_unavailable += 1
+                _cold_start_from_daily(code)
 
             asr_yesterday = float("nan")
-            if prev_date and prev_state is not None and prev_state.exists():
+            if loaded_prev_state and prev_date:
                 bars_prev = get_daily_bars([code], end_time=prev_date, count=11)
                 if bars_prev is not None and not bars_prev.empty:
                     atr_prev = float(calc_atr_10(bars_prev))
@@ -295,28 +944,129 @@ class IndustryETFChipService:
                             )
                         )
 
-            try:
-                etf_info = get_etf_info(code)
-            except Exception as e:
-                _warn_runtime_once(
-                    f"get_etf_info_failed:{trade_date}:{code}",
-                    f"XtData: get_etf_info failed, skip IOPV attach. code={code} date={trade_date} err={repr(e)}",
-                )
-                etf_info = {}
+            if code in etf_info_cache:
+                etf_info = etf_info_cache.get(code, {})
+            else:
+                try:
+                    etf_info = get_etf_info(code)
+                except Exception as e:
+                    _warn_runtime_once(
+                        f"get_etf_info_failed:{trade_date}:{code}",
+                        f"XtData: get_etf_info failed, skip IOPV attach. code={code} date={trade_date} err={repr(e)}",
+                    )
+                    etf_info = {}
+                etf_info_cache[code] = etf_info if isinstance(etf_info, dict) else {}
+            etf_name = code_name_map.get(code, "")
+            if not etf_name:
+                etf_name = _extract_etf_name_from_info(etf_info)
+                if etf_name:
+                    code_name_map[code] = etf_name
             if etf_info:
                 engine.attach_iopv(code, etf_info)
+                # ── 拉取成分股收盘价驱动 IOPV 计算（避免 nav 兜底） ──
+                stocks_dict = etf_info.get("stocks")
+                if isinstance(stocks_dict, dict) and stocks_dict:
+                    _SUPPORTED_MARKETS = (".SH", ".SZ", ".BJ")
+                    comp_codes = [
+                        str(k) for k in stocks_dict
+                        if isinstance(k, str) and str(k).upper().endswith(_SUPPORTED_MARKETS)
+                    ]
+                    missing = [c for c in comp_codes if c not in _constituent_px_cache]
+                    if missing:
+                        try:
+                            t_fetch0 = time.perf_counter()
+                            print(
+                                json.dumps(
+                                    {
+                                        "timing": "etf_chip_engine.service.constituent_fetch_start",
+                                        "trade_date": str(trade_date),
+                                        "code": str(code),
+                                        "missing_codes": int(len(missing)),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                            new_prices = download_constituent_close_prices(
+                                missing,
+                                trade_date,
+                                timeout_sec=int(self.config.get("constituent_download_timeout_sec", 8)),
+                                retry_chunk_size=int(self.config.get("constituent_retry_chunk_size", 30)),
+                                skip_full_if_codes_ge=int(self.config.get("constituent_skip_full_if_codes_ge", 220)),
+                            )
+                            _constituent_px_cache.update(new_prices)
+                            elapsed = max(time.perf_counter() - t_fetch0, 0.0)
+                            print(
+                                json.dumps(
+                                    {
+                                        "timing": "etf_chip_engine.service.constituent_fetch_done",
+                                        "trade_date": str(trade_date),
+                                        "code": str(code),
+                                        "missing_codes": int(len(missing)),
+                                        "fetched_codes": int(len(new_prices)),
+                                        "elapsed_sec": round(float(elapsed), 3),
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                        except Exception as e:
+                            _warn_runtime_once(
+                                f"constituent_price_fetch_failed:{trade_date}:{code}",
+                                f"IOPV: 成分股收盘价拉取失败: code={code} date={trade_date} err={repr(e)}",
+                            )
+                    calc = engine.iopv.get(code)
+                    if calc is not None:
+                        for sc in comp_codes:
+                            px = _constituent_px_cache.get(sc)
+                            if px is not None:
+                                calc.update_stock_price(sc, px)
 
-            ticks = get_market_tick_data(code, trade_date, count=int(self.config.get("daily_tick_count", 2000)))
-            snapshots = ticks_to_snapshots(ticks)
-            if snapshots.empty:
-                ticks_local = get_local_tick_data(code, trade_date)
-                snapshots = ticks_to_snapshots(ticks_local)
-            if snapshots.empty and retry_download_for_empty_tick_code_once(code, trade_date):
-                ticks = get_market_tick_data(code, trade_date, count=int(self.config.get("daily_tick_count", 2000)))
-                snapshots = ticks_to_snapshots(ticks)
-                if snapshots.empty:
+            tick_count = int(self.config.get("daily_tick_count", -1))
+
+            def _load_snapshots_once() -> pd.DataFrame:
+                ticks = get_market_tick_data(code, trade_date, count=tick_count)
+                snaps = ticks_to_snapshots(ticks)
+                if snaps.empty:
                     ticks_local = get_local_tick_data(code, trade_date)
-                    snapshots = ticks_to_snapshots(ticks_local)
+                    snaps = ticks_to_snapshots(ticks_local)
+                return snaps
+
+            snapshots = _load_snapshots_once()
+            if snapshots.empty and retry_download_for_empty_tick_code_once(
+                code,
+                trade_date,
+                timeout_sec=int(self.config.get("empty_tick_retry_timeout_sec", 20)),
+            ):
+                snapshots = _load_snapshots_once()
+            if snapshots.empty:
+                wait_sec = float(max(float(self.config.get("empty_tick_post_retry_wait_sec", 6.0)), 0.0))
+                poll_sec = float(max(float(self.config.get("empty_tick_post_retry_poll_sec", 1.0)), 0.2))
+                if wait_sec > 0:
+                    t_wait0 = time.perf_counter()
+                    deadline = t_wait0 + wait_sec
+                    poll_count = 0
+                    while snapshots.empty and time.perf_counter() < deadline:
+                        sleep_s = min(poll_sec, max(deadline - time.perf_counter(), 0.0))
+                        if sleep_s > 0:
+                            time.sleep(sleep_s)
+                        poll_count += 1
+                        snapshots = _load_snapshots_once()
+                    waited = max(time.perf_counter() - t_wait0, 0.0)
+                    print(
+                        json.dumps(
+                            {
+                                "timing": "etf_chip_engine.service.empty_tick_post_retry_poll",
+                                "trade_date": str(trade_date),
+                                "code": str(code),
+                                "waited_sec": round(float(waited), 3),
+                                "poll_count": int(poll_count),
+                                "recovered": bool(not snapshots.empty),
+                            },
+                            ensure_ascii=False,
+                        ),
+                        flush=True,
+                    )
             if snapshots.empty:
                 skipped += 1
                 progress.update(idx, rows=len(results), skipped=skipped, code=code)
@@ -332,6 +1082,9 @@ class IndustryETFChipService:
                 trade_date=trade_date,
                 snapshots=snapshots,
                 engine=engine,
+                min_iopv_coverage=min_iopv_coverage,
+                etf_name=etf_name,
+                iopv_coverage_downgrade_sink=iopv_coverage_downgraded,
             )
             if premium_rates is not None:
                 snapshots["premium_rate"] = premium_rates.to_numpy(dtype=np.float64, copy=False)
@@ -343,19 +1096,63 @@ class IndustryETFChipService:
                 l1_path = l1_dir / f"{code.replace('.', '_')}.csv"
                 snapshots.to_csv(l1_path, index=False, encoding="utf-8-sig")
 
-            atr = calc_atr_10(get_daily_bars([code], end_time=trade_date, count=11))
+            daily_11_effective = _load_trade_date_daily_bars(
+                code=code,
+                trade_date=trade_date,
+                count=11,
+                snapshots=snapshots,
+                context=f"etf:{code}:atr",
+            )
+            atr = calc_atr_10(daily_11_effective)
 
-            shares_today = get_total_shares(code)
+            shares_detail = get_total_shares_detail(code, trade_date=trade_date)
+            shares_today = float(shares_detail.get("shares", 0.0))
+            shares_source = str(shares_detail.get("source", "none"))
+            if not shares_source.startswith("official_"):
+                _warn_runtime_once(
+                    f"shares_source_fallback:{trade_date}:{code}",
+                    (
+                        "Shares: 官方份额不可用，已降级。"
+                        f" code={code} date={trade_date} source={shares_source}"
+                        f" reason={shares_detail.get('reason', '')}"
+                    ),
+                )
+            if shares_today <= 0 and isinstance(snapshots, pd.DataFrame) and not snapshots.empty:
+                try:
+                    total_amt = snapshots["amount"].astype(float).sum()
+                    total_vol = snapshots["volume"].astype(float).sum()
+                    if total_vol > 0 and total_amt > 0:
+                        # Last-resort fallback: very low confidence estimation.
+                        assumed_daily_tr = 0.05
+                        shares_today = total_vol / assumed_daily_tr
+                        _warn_runtime_once(
+                            f"shares_source_last_resort:{trade_date}:{code}",
+                            (
+                                "Shares: 官方+xtdata 均不可用，已使用低置信度换手率兜底。"
+                                f" code={code} date={trade_date} total_vol={total_vol:.2f}"
+                                f" assumed_daily_tr={assumed_daily_tr:.4f}"
+                            ),
+                        )
+                except Exception:
+                    pass
             shares_yesterday = engine.chips[code].total_shares if engine.chips[code].total_shares > 0 else shares_today
             engine.chips[code].total_shares = shares_yesterday
 
-            out = engine.process_daily(
-                code,
-                snapshots,
-                shares_today=shares_today,
-                shares_yesterday=shares_yesterday,
-                atr=atr,
-            )
+            try:
+                out = engine.process_daily(
+                    code,
+                    snapshots,
+                    shares_today=shares_today,
+                    shares_yesterday=shares_yesterday,
+                    atr=atr,
+                )
+            except ValueError as e:
+                _warn_runtime_once(
+                    f"process_daily_skip:{trade_date}:{code}",
+                    f"process_daily 跳过: code={code} date={trade_date} err={e}",
+                )
+                skipped += 1
+                continue
             if premium_rates is None and "premium_rate" in snapshots.columns:
                 try:
                     premium_rates = snapshots["premium_rate"].astype(np.float64)
@@ -367,14 +1164,7 @@ class IndustryETFChipService:
                     premium_rates = pd.Series(np.zeros(len(snapshots), dtype=np.float64), index=snapshots.index)
 
             # Compute ADV_60 for VPIN cross-day comparability (V2.1)
-            bars_60 = get_daily_bars([code], end_time=trade_date, count=61)
-            adv_60 = None
-            if bars_60 is not None and len(bars_60) > 1:
-                # Exclude today (last row if it matches trade_date)
-                hist_bars = bars_60.iloc[:-1] if len(bars_60) > 1 else bars_60
-                vol_col = hist_bars["volume"] if "volume" in hist_bars.columns else hist_bars.get("vol")
-                if vol_col is not None and len(vol_col) > 0:
-                    adv_60 = float(vol_col.mean())
+            adv_60 = _compute_adv_60(code=code, trade_date=trade_date, prev_trade_date=str(prev_date or ""))
 
             ms_out = ms_engine.process_daily(
                 etf_code=code,
@@ -420,6 +1210,58 @@ class IndustryETFChipService:
         if total_codes == 0:
             print("progress [------------------------]    0/0   100.00% rows=   0 skipped=   0 speed= 0.00/s eta=00:00", flush=True)
 
+        print(
+            json.dumps(
+                {
+                    "timing": "etf_chip_engine.service.prev_state_load_summary",
+                    "trade_date": str(trade_date),
+                    "prev_date": str(prev_date),
+                    "total_codes": int(total_codes),
+                    "loaded_count": int(prev_state_loaded),
+                    "missing_count": int(prev_state_missing),
+                    "load_failed_count": int(prev_state_load_failed),
+                    "prev_date_unavailable_count": int(prev_date_unavailable),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
+        downgraded_by_code: dict[str, dict[str, Any]] = {}
+        for item in iopv_coverage_downgraded:
+            code_k = str(item.get("code", "")).strip().upper()
+            if not code_k:
+                continue
+            old = downgraded_by_code.get(code_k)
+            coverage_v = item.get("coverage")
+            if old is None:
+                downgraded_by_code[code_k] = dict(item)
+                continue
+            if old.get("coverage") is None and coverage_v is not None:
+                downgraded_by_code[code_k] = dict(item)
+
+        downgraded_items = [
+            {
+                "code": code_k,
+                "name": str(v.get("name", "")).strip(),
+                "coverage": v.get("coverage"),
+            }
+            for code_k, v in sorted(downgraded_by_code.items(), key=lambda kv: kv[0])
+        ]
+        print(
+            json.dumps(
+                {
+                    "timing": "etf_chip_engine.service.iopv_coverage_downgrade_summary",
+                    "trade_date": str(trade_date),
+                    "threshold": float(min_iopv_coverage),
+                    "count": int(len(downgraded_items)),
+                    "items": downgraded_items,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+
         df_result = pd.DataFrame(results)
 
         # 鈹€鈹€ Cross-sectional ranking (V2.1) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -454,4 +1296,3 @@ class IndustryETFChipService:
                 info_once("micro_xs_ranking_failed", f"Micro: 妯埅闈㈡帓鍚嶈绠楀け璐ワ紝宸查檷绾ц烦杩? err={repr(e)}", logger_name=__name__)
 
         return df_result
-

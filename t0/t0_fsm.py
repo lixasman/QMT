@@ -6,6 +6,7 @@ from typing import Optional, Protocol
 
 from core.enums import FSMState
 from core.interfaces import DataAdapter, InstrumentInfo, TickSnapshot, TradingAdapter
+from core.warn_utils import degrade_once
 
 from .breaker import forbid_forward_buy_by_extreme, forbid_reverse_sell_by_extreme
 from .kde_support import KdeZones, load_kde_zones
@@ -77,6 +78,10 @@ class T0Engine:
         inst = self._data.get_instrument_info(code)
         v = self._vwap.update(snapshot=snap)
         if v.data_quality.value != "OK":
+            degrade_once(
+                f"t0_vwap_data_quality_not_ok:{code}:{str(v.data_quality.value)}",
+                f"T0 signal evaluation skipped due to VWAP data quality. etf={code} quality={v.data_quality.value}",
+            )
             return None
 
         pos = self._position
@@ -89,6 +94,8 @@ class T0Engine:
 
         r = self._regime.get(code)
         if r is None or bool(r.regime_active) is False:
+            if r is None:
+                degrade_once(f"t0_regime_missing:{code}", f"T0 regime missing; signal evaluation skipped. etf={code}")
             return None
 
         kz = self._kde.get(code)

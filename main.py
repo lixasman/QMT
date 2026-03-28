@@ -30,7 +30,19 @@ def main() -> int:
         raise NotImplementedError("replay mode is not implemented yet")
 
     cfg = parse_strategy_config(rest)
-    log.info("startup | adapter=%s watchlist=%s", cfg.trading_adapter_type, ",".join(cfg.watchlist_etf_codes))
+    log.info(
+        "startup | adapter=%s watchlist=%s watch_auto=%s watch_auto_no_filter=%s phase2_s_micro_missing=%s",
+        cfg.trading_adapter_type,
+        ",".join(cfg.watchlist_etf_codes),
+        bool(getattr(cfg, "watch_auto", False)),
+        bool(getattr(cfg, "watch_auto_no_filter", False)),
+        ("" if getattr(cfg, "phase2_s_micro_missing", None) is None else str(getattr(cfg, "phase2_s_micro_missing"))),
+    )
+    if getattr(cfg, "phase2_s_micro_missing", None) is not None:
+        log.warning(
+            "TEST override enabled | phase2_s_micro_missing=%s (used only when micro factors are missing)",
+            float(getattr(cfg, "phase2_s_micro_missing")),
+        )
     runner = StrategyRunner(cfg)
     runner.run_day(wait_for_market=True)
     log.info("shutdown")
@@ -39,4 +51,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -58,10 +58,10 @@ def validate_watchlist(items: list[WatchlistItem]) -> None:
             raise AssertionError(f"profit_ratio out of range: {it.etf_code} {it.profit_ratio}")
 
 
-def filter_watchlist(items: list[WatchlistItem]) -> list[WatchlistItem]:
+def filter_watchlist(items: list[WatchlistItem], *, min_sentiment: int = 60) -> list[WatchlistItem]:
     out: list[WatchlistItem] = []
     for it in items:
-        if int(it.sentiment_score) < 60:
+        if int(it.sentiment_score) < int(min_sentiment):
             continue
         if float(it.profit_ratio) < 75.0:
             continue

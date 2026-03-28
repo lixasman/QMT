@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import concurrent.futures
 import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -11,11 +10,13 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Iterable, Optional
 
 import requests
 
+from core.time_utils import get_trading_dates
 from newsget.ingestion import fetch_top10_news
 from newsget.models import NewsItem
 from newsget.sources.eastmoney_etf import EtfHolding, fetch_etf_top10_holdings
@@ -32,6 +33,14 @@ except Exception:  # pragma: no cover
 
 
 WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+_DOWNGRADE_WARNED: set[str] = set()
+
+
+def _warn_downgrade_once(key: str, msg: str) -> None:
+    if key in _DOWNGRADE_WARNED:
+        return
+    _DOWNGRADE_WARNED.add(key)
+    logging.getLogger(__name__).warning(msg)
 
 
 @dataclass(frozen=True)
@@ -76,6 +85,68 @@ def _chip_batch_csv_candidates() -> list[Path]:
     return files
 
 
+_MICRO_WARMUP_MIN_HISTORY = 5
+_MICRO_WARMUP_TARGET_DAYS = _MICRO_WARMUP_MIN_HISTORY + 1
+
+
+def _micro_factor_history_candidates() -> list[Path]:
+    p = os.environ.get("CHIP_FACTOR_HISTORY_DIR", "").strip()
+    if p:
+        return [Path(p)]
+    root = _project_root()
+    return [
+        root / "data" / "factor_history",
+        root / "etf_chip_engine" / "data" / "factor_history",
+    ]
+
+
+def _micro_warmup_remaining_days(etf_code_norm: str) -> tuple[int, str, str]:
+    code_key = normalize_code(etf_code_norm).replace(".", "_")
+    candidates = _micro_factor_history_candidates()
+    target_path: Optional[Path] = None
+    for base in candidates:
+        p = base / f"{code_key}.csv"
+        if p.exists():
+            target_path = p
+            break
+    if target_path is None:
+        fallback = candidates[0] / f"{code_key}.csv"
+        return _MICRO_WARMUP_TARGET_DAYS, "", str(fallback)
+
+    cols = [
+        "vpin_orthogonalized",
+        "vpin_max",
+        "ofi_daily",
+        "kyle_lambda",
+        "volume_surprise",
+    ]
+    finite_counts: dict[str, int] = {c: 0 for c in cols}
+    try:
+        with target_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                for c in cols:
+                    v = _parse_float(row.get(c))
+                    if v is not None:
+                        finite_counts[c] += 1
+    except Exception as e:
+        _warn_downgrade_once(
+            f"micro_warmup_read_failed:{target_path}",
+            f"MicroWarmup: 历史读取失败，已降级按冷启动处理: file={target_path} err={repr(e)}",
+        )
+        return _MICRO_WARMUP_TARGET_DAYS, "", str(target_path)
+
+    remaining_map = {
+        c: max(0, _MICRO_WARMUP_TARGET_DAYS - int(finite_counts.get(c, 0)))
+        for c in cols
+    }
+    remaining = int(max(remaining_map.values())) if remaining_map else _MICRO_WARMUP_TARGET_DAYS
+    detail = ",".join(f"{k}:{v}" for k, v in remaining_map.items())
+    return remaining, detail, str(target_path)
+
+
 def _parse_float(x: Any) -> Optional[float]:
     try:
         v = float(x)
@@ -94,7 +165,11 @@ def _format_chip_dense_zones(raw: str, *, current_price: Optional[float] = None,
     except Exception:
         try:
             obj = ast.literal_eval(s)
-        except Exception:
+        except Exception as e:
+            _warn_downgrade_once(
+                "chip_dense_zones_parse_failed",
+                f"ChipFactor: dense_zones 解析失败，已降级为空。sample={s[:80]} err={repr(e)}",
+            )
             return ""
     if not isinstance(obj, list) or not obj:
         return ""
@@ -125,6 +200,7 @@ def _format_chip_dense_zones(raw: str, *, current_price: Optional[float] = None,
 def load_chip_factors(etf_code_norm: str, *, current_price: Optional[float] = None) -> dict[str, str]:
     strict = os.environ.get("CHIP_FACTOR_STRICT", "").strip() == "1"
     micro_strict = os.environ.get("MICRO_STRICT", "").strip() == "1"
+    warmup_remaining, warmup_detail, warmup_history_path = _micro_warmup_remaining_days(etf_code_norm)
     candidates = _chip_batch_csv_candidates()
     if not candidates:
         msg = f"ChipFactor: 未找到 batch_results_*.csv（可用 CHIP_BATCH_DIR/CHIP_BATCH_CSV 指定路径），etf={etf_code_norm}"
@@ -141,6 +217,7 @@ def load_chip_factors(etf_code_norm: str, *, current_price: Optional[float] = No
             "ms_ofi_daily_z": "数据缺失",
             "ms_kyle_lambda_z": "数据缺失",
             "ms_vs_max_logz": "数据缺失",
+            "ms_warmup_remaining_days": str(int(warmup_remaining)),
         }
 
     target = normalize_code(etf_code_norm)
@@ -183,17 +260,19 @@ def load_chip_factors(etf_code_norm: str, *, current_price: Optional[float] = No
             "ms_ofi_daily_z": "数据缺失",
             "ms_kyle_lambda_z": "数据缺失",
             "ms_vs_max_logz": "数据缺失",
+            "ms_warmup_remaining_days": str(int(warmup_remaining)),
         }
 
     trade_date = str(found.get("trade_date") or "").strip()
     pr = _parse_float(found.get("profit_ratio"))
     asr = _parse_float(found.get("asr"))
     dz = _format_chip_dense_zones(str(found.get("dense_zones") or ""), current_price=current_price)
-    ms_vpin_rank = _parse_float(found.get("ms_vpin_rank"))
-    ms_vpin_max_rank = _parse_float(found.get("ms_vpin_max_rank"))
-    ms_ofi_daily_z = _parse_float(found.get("ms_ofi_daily_z"))
-    ms_kyle_lambda_z = _parse_float(found.get("ms_kyle_lambda_z"))
-    ms_vs_max_logz = _parse_float(found.get("ms_vs_max_logz"))
+    # Latest etf_chip_engine batch schema (no "ms_" prefix).
+    vpin_rank = _parse_float(found.get("vpin_rank"))
+    vpin_max_rank = _parse_float(found.get("vpin_max_rank"))
+    ofi_daily_z = _parse_float(found.get("ofi_daily_z"))
+    kyle_lambda_z = _parse_float(found.get("kyle_lambda_z"))
+    vs_max_logz = _parse_float(found.get("vs_max_logz"))
 
     if pr is None or asr is None or not dz:
         logging.getLogger(__name__).warning(
@@ -208,14 +287,20 @@ def load_chip_factors(etf_code_norm: str, *, current_price: Optional[float] = No
         if strict:
             raise RuntimeError(f"ChipFactor: 字段缺失/不可解析 etf={target} file={csv_path}")
 
-    if any(v is None for v in (ms_vpin_rank, ms_vpin_max_rank, ms_ofi_daily_z, ms_kyle_lambda_z, ms_vs_max_logz)):
+    if any(v is None for v in (vpin_rank, vpin_max_rank, ofi_daily_z, kyle_lambda_z, vs_max_logz)):
         logging.getLogger(__name__).warning(
-            "MicroFactor: 字段缺失/不可解析 etf=%s file=%s trade_date=%s ms_vpin_rank=%s ms_ofi_daily_z=%s",
+            (
+                "MicroFactor: 字段缺失/不可解析 etf=%s file=%s trade_date=%s "
+                "vpin_rank=%s ofi_daily_z=%s warmup_remaining_days=%s warmup_detail=%s history_file=%s"
+            ),
             target,
             str(csv_path),
             trade_date,
-            str(found.get("ms_vpin_rank")),
-            str(found.get("ms_ofi_daily_z")),
+            str(found.get("vpin_rank")),
+            str(found.get("ofi_daily_z")),
+            int(warmup_remaining),
+            warmup_detail,
+            warmup_history_path,
         )
         if micro_strict:
             raise RuntimeError(f"MicroFactor: 字段缺失/不可解析 etf={target} file={csv_path}")
@@ -225,11 +310,12 @@ def load_chip_factors(etf_code_norm: str, *, current_price: Optional[float] = No
         "chip_profit_ratio": (f"{pr:.2f}" if pr is not None else "数据缺失"),
         "chip_dense_zones": (dz if dz else "数据缺失"),
         "chip_asr": (f"{asr:.4f}" if asr is not None else "数据缺失"),
-        "ms_vpin_rank": (f"{ms_vpin_rank:.3f}" if ms_vpin_rank is not None else "数据缺失"),
-        "ms_vpin_max_rank": (f"{ms_vpin_max_rank:.3f}" if ms_vpin_max_rank is not None else "数据缺失"),
-        "ms_ofi_daily_z": (f"{ms_ofi_daily_z:.3f}" if ms_ofi_daily_z is not None else "数据缺失"),
-        "ms_kyle_lambda_z": (f"{ms_kyle_lambda_z:.3f}" if ms_kyle_lambda_z is not None else "数据缺失"),
-        "ms_vs_max_logz": (f"{ms_vs_max_logz:.3f}" if ms_vs_max_logz is not None else "数据缺失"),
+        "ms_vpin_rank": (f"{vpin_rank:.3f}" if vpin_rank is not None else "数据缺失"),
+        "ms_vpin_max_rank": (f"{vpin_max_rank:.3f}" if vpin_max_rank is not None else "数据缺失"),
+        "ms_ofi_daily_z": (f"{ofi_daily_z:.3f}" if ofi_daily_z is not None else "数据缺失"),
+        "ms_kyle_lambda_z": (f"{kyle_lambda_z:.3f}" if kyle_lambda_z is not None else "数据缺失"),
+        "ms_vs_max_logz": (f"{vs_max_logz:.3f}" if vs_max_logz is not None else "数据缺失"),
+        "ms_warmup_remaining_days": str(int(warmup_remaining)),
     }
 
 
@@ -424,11 +510,19 @@ def _pick_latest_kline_series(raw: dict[str, Any], code: str) -> Optional[KlineS
         except Exception:
             try:
                 row = df.loc[str(code)]
-            except Exception:
+            except Exception as e:
+                _warn_downgrade_once(
+                    f"kline_loc_failed:{code}:{name}",
+                    f"Signal: 行情字段定位失败，已降级空序列。code={code} field={name} err={repr(e)}",
+                )
                 return []
         try:
             items = list(row.items())
-        except Exception:
+        except Exception as e:
+            _warn_downgrade_once(
+                f"kline_items_failed:{code}:{name}",
+                f"Signal: 行情字段结构异常，已降级空序列。code={code} field={name} err={repr(e)}",
+            )
             return []
         items.sort(key=lambda x: x[0])
         return [_safe_float(v) for _, v in items]
@@ -441,7 +535,11 @@ def _pick_latest_kline_series(raw: dict[str, Any], code: str) -> Optional[KlineS
             items = list(row.items())
             items.sort(key=lambda x: x[0])
             times = [t for t, _ in items]
-        except Exception:
+        except Exception as e:
+            _warn_downgrade_once(
+                f"kline_time_parse_failed:{code}",
+                f"Signal: time 字段解析失败，已降级使用序号时间。code={code} err={repr(e)}",
+            )
             times = []
 
     opens = [v if v is not None else float("nan") for v in get_field("open")]
@@ -484,7 +582,11 @@ def _env_float(name: str, default: float) -> float:
     try:
         s = os.environ.get(name, "").strip()
         return float(s) if s else float(default)
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"env_float_parse_failed:{name}",
+            f"Signal: 环境变量解析失败，已降级默认值。name={name} err={repr(e)}",
+        )
         return float(default)
 
 
@@ -498,24 +600,50 @@ def _run_with_timeout(
 ):
     if timeout_seconds <= 0:
         return fn()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(fn)
+    done = threading.Event()
+    box: dict[str, Any] = {"value": default, "exc": None, "ok": False}
+
+    def _target() -> None:
         try:
-            return fut.result(timeout=timeout_seconds)
-        except concurrent.futures.TimeoutError:
-            logging.getLogger(__name__).warning("Signal: %s 超时(>%ss)，已跳过", label, int(timeout_seconds))
-            return default
-        except Exception as e:
-            if propagate and isinstance(e, propagate):
-                raise
-            logging.getLogger(__name__).warning("Signal: %s 失败: %s", label, repr(e))
-            return default
+            box["value"] = fn()
+            box["ok"] = True
+        except Exception as e:  # pragma: no cover
+            box["exc"] = e
+        finally:
+            done.set()
+
+    th = threading.Thread(
+        target=_target,
+        name=f"finintel-timeout-{label}",
+        daemon=True,
+    )
+    th.start()
+
+    if not done.wait(timeout=float(timeout_seconds)):
+        logging.getLogger(__name__).warning("Signal: %s 超时(>%ss)，已跳过", label, int(timeout_seconds))
+        return default
+
+    err = box.get("exc")
+    if err is not None:
+        if propagate and isinstance(err, propagate):
+            raise err
+        logging.getLogger(__name__).warning("Signal: %s 失败: %s", label, repr(err))
+        return default
+    return box.get("value", default)
 
 
 def _xt_download_daily(stock_list: list[str], *, start_time: str) -> None:
     if not _xtdata_available():
+        _warn_downgrade_once(
+            "xt_download_daily_unavailable",
+            "Signal: xtdata 不可用，已降级跳过日线下载。",
+        )
         return
     if os.environ.get("FININTEL_SKIP_XTDATA_DOWNLOAD", "").strip() == "1":
+        _warn_downgrade_once(
+            "xt_download_daily_skipped_by_env",
+            "Signal: FININTEL_SKIP_XTDATA_DOWNLOAD=1，已降级跳过日线下载。",
+        )
         return
     timeout_seconds = _env_float("FININTEL_XTDATA_TIMEOUT_SECONDS", 35.0)
     try:
@@ -528,7 +656,10 @@ def _xt_download_daily(stock_list: list[str], *, start_time: str) -> None:
         )
         return
     except TypeError:
-        pass
+        _warn_downgrade_once(
+            "xt_download_daily_sig_fallback_6args",
+            "Signal: xtdata.download_history_data2 6参签名不可用，降级尝试 5参签名。",
+        )
     try:
         _run_with_timeout(
             lambda: _xtdata.download_history_data2(stock_list, "1d", start_time, "", None),
@@ -539,7 +670,10 @@ def _xt_download_daily(stock_list: list[str], *, start_time: str) -> None:
         )
         return
     except TypeError:
-        pass
+        _warn_downgrade_once(
+            "xt_download_daily_sig_fallback_5args",
+            "Signal: xtdata.download_history_data2 5参签名不可用，降级尝试 4参签名。",
+        )
     _run_with_timeout(
         lambda: _xtdata.download_history_data2(stock_list, "1d", start_time, ""),
         timeout_seconds=timeout_seconds,
@@ -550,11 +684,19 @@ def _xt_download_daily(stock_list: list[str], *, start_time: str) -> None:
 
 def _xt_get_daily(stock_list: list[str], *, count: int) -> dict[str, Any]:
     if not _xtdata_available():
+        _warn_downgrade_once(
+            "xt_get_daily_unavailable",
+            "Signal: xtdata 不可用，已降级为空行情。",
+        )
         return {}
     if os.environ.get("FININTEL_SKIP_XTDATA_MARKET", "").strip() == "1":
+        _warn_downgrade_once(
+            "xt_get_daily_skipped_by_env",
+            "Signal: FININTEL_SKIP_XTDATA_MARKET=1，已降级为空行情。",
+        )
         return {}
     timeout_seconds = _env_float("FININTEL_XTDATA_TIMEOUT_SECONDS", 35.0)
-    return _run_with_timeout(
+    raw = _run_with_timeout(
         lambda: _xtdata.get_market_data(
             field_list=["time", "open", "high", "low", "close", "volume", "amount"],
             stock_list=stock_list,
@@ -569,6 +711,22 @@ def _xt_get_daily(stock_list: list[str], *, count: int) -> dict[str, Any]:
         label="xtdata.get_market_data(1d)",
         default={},
     )
+    if not isinstance(raw, dict):
+        logging.getLogger(__name__).warning(
+            "Signal: xtdata.get_market_data 返回结构异常，已降级为空。type=%s size=%s",
+            type(raw).__name__,
+            len(stock_list),
+        )
+        return {}
+    required = ("close", "open", "high", "low", "volume", "amount")
+    missing = [k for k in required if raw.get(k) is None]
+    if missing:
+        logging.getLogger(__name__).warning(
+            "Signal: xtdata.get_market_data 关键字段缺失，已降级继续。missing=%s size=%s",
+            ",".join(missing),
+            len(stock_list),
+        )
+    return raw
 
 
 def _xt_get_instrument_name(code: str) -> str:
@@ -591,13 +749,21 @@ def _xt_get_last_close(raw: dict[str, Any], code: str) -> Optional[float]:
     except Exception:
         try:
             row = close_df.loc[str(code)]
-        except Exception:
+        except Exception as e:
+            _warn_downgrade_once(
+                f"xt_last_close_loc_failed:{code}",
+                f"Signal: last_close 定位失败，已降级缺失。code={code} err={repr(e)}",
+            )
             row = None
     if row is None:
         return None
     try:
         items = list(row.items())
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"xt_last_close_items_failed:{code}",
+            f"Signal: last_close 结构异常，已降级缺失。code={code} err={repr(e)}",
+        )
         return None
     if not items:
         return None
@@ -610,7 +776,11 @@ def _xt_etf_basket_top5_holdings(etf_code_norm: str, *, preselect_top_n: int = 8
         return []
     try:
         info = _xtdata.get_etf_info(etf_code_norm)
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"basket_get_etf_info_failed:{etf_code_norm}",
+            f"Signal: XtQuant 申赎清单读取失败，已降级为空持仓。etf={etf_code_norm} err={repr(e)}",
+        )
         return []
     if not isinstance(info, dict):
         return []
@@ -661,8 +831,16 @@ def _xt_etf_basket_top5_holdings(etf_code_norm: str, *, preselect_top_n: int = 8
 
 def _xt_download_history_data2_compat(stock_list: list[str], period: str, *, start_time: str) -> None:
     if not _xtdata_available():
+        _warn_downgrade_once(
+            "xt_download_history_compat_unavailable",
+            "Signal: xtdata 不可用，已降级跳过历史数据下载。",
+        )
         return
     if os.environ.get("FININTEL_SKIP_XTDATA_DOWNLOAD", "").strip() == "1":
+        _warn_downgrade_once(
+            "xt_download_history_compat_skipped_by_env",
+            "Signal: FININTEL_SKIP_XTDATA_DOWNLOAD=1，已降级跳过历史数据下载。",
+        )
         return
     timeout_seconds = _env_float("FININTEL_XTDATA_TIMEOUT_SECONDS", 35.0)
     try:
@@ -675,7 +853,10 @@ def _xt_download_history_data2_compat(stock_list: list[str], period: str, *, sta
         )
         return
     except TypeError:
-        pass
+        _warn_downgrade_once(
+            "xt_download_history_sig_fallback_6args",
+            "Signal: xtdata.download_history_data2 6参签名不可用，降级尝试 5参签名。",
+        )
     try:
         _run_with_timeout(
             lambda: _xtdata.download_history_data2(stock_list, period, start_time, "", None),
@@ -686,7 +867,10 @@ def _xt_download_history_data2_compat(stock_list: list[str], period: str, *, sta
         )
         return
     except TypeError:
-        pass
+        _warn_downgrade_once(
+            "xt_download_history_sig_fallback_5args",
+            "Signal: xtdata.download_history_data2 5参签名不可用，降级尝试 4参签名。",
+        )
     _run_with_timeout(
         lambda: _xtdata.download_history_data2(stock_list, period, start_time, ""),
         timeout_seconds=timeout_seconds,
@@ -703,11 +887,79 @@ def _chunked(xs: list[str], size: int) -> Iterable[list[str]]:
         yield xs[i : i + size]
 
 
+def _env_flag_enabled(name: str, *, default: bool) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if not raw:
+        return bool(default)
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _prev_trading_day(today: str) -> str:
+    try:
+        dt = datetime.strptime(str(today), "%Y%m%d")
+    except Exception:
+        return ""
+    start = (dt - timedelta(days=40)).strftime("%Y%m%d")
+    try:
+        cal = get_trading_dates(start, today)
+    except Exception as e:
+        _warn_downgrade_once(
+            "signal_prev_trading_day_query_failed",
+            f"Signal: failed to query trading calendar for previous trading day; fallback to natural date. today={today} err={repr(e)}",
+        )
+        return ""
+    prev = ""
+    for d in cal:
+        s = str(d)
+        if len(s) == 8 and s.isdigit() and s < today and s > prev:
+            prev = s
+    return prev
+
+
 def _today_yyyymmdd() -> str:
     fake = os.environ.get("FININTEL_FAKE_TODAY", "").strip()
-    if re.fullmatch(r"\d{8}", fake):
-        return fake
-    return datetime.now().astimezone().strftime("%Y%m%d")
+    if fake:
+        if re.fullmatch(r"\d{8}", fake):
+            return fake
+        _warn_downgrade_once(
+            "signal_fake_today_invalid",
+            f"Signal: invalid FININTEL_FAKE_TODAY ignored (expected YYYYMMDD): {fake!r}",
+        )
+
+    today = datetime.now().astimezone().strftime("%Y%m%d")
+    if not _env_flag_enabled("FININTEL_INDEX_NON_TRADING_TO_PREV", default=True):
+        _warn_downgrade_once(
+            "signal_non_trading_index_disabled",
+            "Signal: non-trading-day index remap disabled by FININTEL_INDEX_NON_TRADING_TO_PREV=0; using natural date.",
+        )
+        return today
+
+    try:
+        today_cal = get_trading_dates(today, today)
+    except Exception as e:
+        _warn_downgrade_once(
+            "signal_today_calendar_query_failed",
+            f"Signal: failed to query trading calendar for today; fallback to natural date. today={today} err={repr(e)}",
+        )
+        return today
+
+    is_trading_day = any(str(d) == today for d in today_cal)
+    if is_trading_day:
+        return today
+
+    prev = _prev_trading_day(today)
+    if prev:
+        _warn_downgrade_once(
+            f"signal_non_trading_day_remap:{today}",
+            f"Signal: non-trading day detected; remap output date to previous trading day. today={today} indexed_day={prev}",
+        )
+        return prev
+
+    _warn_downgrade_once(
+        f"signal_prev_trading_day_missing:{today}",
+        f"Signal: non-trading day detected but previous trading day unavailable; fallback to natural date. today={today}",
+    )
+    return today
 
 
 def compute_up_down_ratio_all() -> str:
@@ -722,11 +974,18 @@ def compute_up_down_ratio_all() -> str:
         try:
             s = cache_path.read_text(encoding="utf-8").strip()
             return s
-        except Exception:
-            pass
+        except Exception as e:
+            _warn_downgrade_once(
+                f"updown_cache_read_failed:{cache_path}",
+                f"Signal: 市场宽度缓存读取失败，已降级实时计算。path={cache_path} err={repr(e)}",
+            )
     try:
         sectors = _xtdata.get_sector_list()
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            "updown_get_sector_list_failed",
+            f"Signal: 市场宽度 sector 列表读取失败，已降级为空。err={repr(e)}",
+        )
         return ""
     if not isinstance(sectors, list):
         return ""
@@ -736,10 +995,12 @@ def compute_up_down_ratio_all() -> str:
         return ""
 
     codes: set[str] = set()
+    sector_fetch_failed = 0
     for sec in targets:
         try:
             lst = _xtdata.get_stock_list_in_sector(sec)
         except Exception:
+            sector_fetch_failed += 1
             continue
         if not isinstance(lst, list):
             continue
@@ -756,6 +1017,7 @@ def compute_up_down_ratio_all() -> str:
 
     up = down = flat = 0
     chunks = list(_chunked(all_codes, 1800))
+    bad_chunks = 0
 
     timeout_seconds = _env_float("FININTEL_XTDATA_TIMEOUT_SECONDS", 35.0)
     for i, chunk in enumerate(chunks, start=1):
@@ -788,6 +1050,7 @@ def compute_up_down_ratio_all() -> str:
             close_s = close_df[last_col]
             pre_s = pre_df[last_col]
         except Exception:
+            bad_chunks += 1
             continue
 
         try:
@@ -796,7 +1059,21 @@ def compute_up_down_ratio_all() -> str:
             down += int((diffs < 0).sum())
             flat += int((diffs == 0).sum())
         except Exception:
+            bad_chunks += 1
             continue
+
+    if sector_fetch_failed > 0:
+        logging.getLogger(__name__).warning(
+            "Signal: 市场宽度部分 sector 拉取失败，已降级跳过。failed=%s total=%s",
+            int(sector_fetch_failed),
+            int(len(targets)),
+        )
+    if bad_chunks > 0:
+        logging.getLogger(__name__).warning(
+            "Signal: 市场宽度部分分块解析失败，已降级跳过。failed_chunks=%s total_chunks=%s",
+            int(bad_chunks),
+            int(len(chunks)),
+        )
 
     if up == 0 and down == 0 and flat == 0:
         return ""
@@ -804,75 +1081,92 @@ def compute_up_down_ratio_all() -> str:
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(ratio, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        _warn_downgrade_once(
+            f"updown_cache_write_failed:{cache_path}",
+            f"Signal: 市场宽度缓存写入失败，已降级继续。path={cache_path} err={repr(e)}",
+        )
     return ratio
 
 
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"load_json_failed:{path}",
+            f"Signal: JSON 读取失败，已降级为空对象。path={path} err={repr(e)}",
+        )
         return {}
 
 
 def snapshot_all_etf_shares() -> tuple[dict[str, float], Optional[Path]]:
-    try:
-        import akshare as ak  # type: ignore
-    except Exception:
-        return {}, None
     state_dir = Path("output") / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     day = _today_yyyymmdd()
     dated_path = state_dir / f"etf_share_snapshot_{day}.json"
     latest_path = state_dir / "etf_share_snapshot.json"
+    existing: dict[str, float] = {}
     if dated_path.exists():
         cur = _load_json(dated_path)
-        shares = cur.get("shares") if isinstance(cur, dict) else None
-        if isinstance(shares, dict):
-            return {str(k): float(v) for k, v in shares.items() if _safe_float(v) is not None}, dated_path
+        shares0 = cur.get("shares") if isinstance(cur, dict) else None
+        if isinstance(shares0, dict):
+            existing = {str(k): float(v) for k, v in shares0.items() if _safe_float(v) is not None}
+            src0 = str(cur.get("source") or "").strip().lower()
+            has_sh = any(str(k).endswith(".SH") for k in existing)
+            has_sz = any(str(k).endswith(".SZ") for k in existing)
+            if src0 == "official" and has_sh and has_sz:
+                return existing, dated_path
+
+    try:
+        from etf_chip_engine.data.xtdata_provider import (  # type: ignore
+            _get_sse_official_share_map,
+            _get_szse_official_share_map,
+        )
+    except Exception as e:
+        _warn_downgrade_once(
+            "snapshot_import_official_shares_failed",
+            f"Signal: 官方份额接口不可用，份额快照已降级关闭。err={repr(e)}",
+        )
+        return (existing, dated_path) if existing else ({}, None)
 
     shares: dict[str, float] = {}
-    sz_df = None
-    sh_df = None
-    try:
-        sz_df = ak.fund_etf_scale_szse()
-    except Exception:
-        sz_df = None
-    for back_days in range(0, 8):
-        dt = datetime.strptime(day, "%Y%m%d") - timedelta(days=back_days)
-        d0 = dt.strftime("%Y%m%d")
-        try:
-            sh_df = ak.fund_etf_scale_sse(date=d0)
-            if sh_df is not None and not getattr(sh_df, "empty", True):
-                break
-        except Exception:
-            sh_df = None
-    if sh_df is not None and not getattr(sh_df, "empty", True):
-        try:
-            for _, r in sh_df.iterrows():
-                code6 = str(r.get("基金代码") or "").strip()
-                val = _safe_float(r.get("基金份额"))
-                if re.fullmatch(r"\d{6}", code6) and val is not None:
-                    shares[f"{code6}.SH"] = float(val)
-        except Exception:
-            pass
-    if sz_df is not None and not getattr(sz_df, "empty", True):
-        try:
-            for _, r in sz_df.iterrows():
-                code6 = str(r.get("基金代码") or "").strip()
-                val = _safe_float(r.get("基金份额"))
-                if re.fullmatch(r"\d{6}", code6) and val is not None:
-                    shares[f"{code6}.SZ"] = float(val)
-        except Exception:
-            pass
+    sh_map, sh_err = _get_sse_official_share_map(trade_date=day)
+    if isinstance(sh_map, dict):
+        for k, v in sh_map.items():
+            vv = _safe_float(v)
+            if vv is not None and vv > 0:
+                shares[str(k)] = float(vv)
+    sz_map, sz_err = _get_szse_official_share_map()
+    if isinstance(sz_map, dict):
+        for k, v in sz_map.items():
+            vv = _safe_float(v)
+            if vv is not None and vv > 0:
+                shares[str(k)] = float(vv)
 
     if not shares:
-        return {}, None
+        _warn_downgrade_once(
+            f"snapshot_official_empty:{day}",
+            "Signal: 官方份额快照为空，已降级继续（可能影响 share_change_text）。",
+        )
+        return (existing, dated_path) if existing else ({}, None)
 
-    payload = {"date": day, "time": datetime.now().astimezone().isoformat(timespec="seconds"), "shares": shares}
-    dated_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = {
+        "date": day,
+        "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source": "official",
+        "errors": {"sse": str(sh_err or ""), "szse": str(sz_err or "")},
+        "shares": shares,
+    }
+    try:
+        dated_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        _warn_downgrade_once(
+            f"snapshot_write_failed:{dated_path}",
+            f"Signal: 份额快照写入失败，已降级继续。path={dated_path} err={repr(e)}",
+        )
+        return shares, None
     return shares, dated_path
 
 
@@ -881,13 +1175,24 @@ def compute_share_change_from_snapshot(etf_code_norm: str) -> tuple[str, str]:
     day = _today_yyyymmdd()
     today_path = state_dir / f"etf_share_snapshot_{day}.json"
     cur = _load_json(today_path) if today_path.exists() else {}
-    cur_shares = cur.get("shares") if isinstance(cur, dict) else None
-    cur_val = _safe_float(cur_shares.get(etf_code_norm)) if isinstance(cur_shares, dict) else None
-    if cur_val is None:
-        cur_shares2, _ = snapshot_all_etf_shares()
-        cur_val = _safe_float(cur_shares2.get(etf_code_norm))
+    cur_source = str(cur.get("source") or "").strip().lower() if isinstance(cur, dict) else ""
+    cur_shares0 = cur.get("shares") if isinstance(cur, dict) else None
+    cur_shares: dict[str, float] = {}
+    if isinstance(cur_shares0, dict):
+        cur_shares = {str(k): float(v) for k, v in cur_shares0.items() if _safe_float(v) is not None}
+    has_sh = any(str(k).endswith(".SH") for k in cur_shares)
+    has_sz = any(str(k).endswith(".SZ") for k in cur_shares)
+    if cur_source != "official" or not has_sh or not has_sz:
+        cur_shares2, p = snapshot_all_etf_shares()
+        cur_shares = cur_shares2
+        if p is not None and p.exists():
+            cur2 = _load_json(p)
+            cur_source = str(cur2.get("source") or "").strip().lower() if isinstance(cur2, dict) else cur_source
+
+    cur_val = _safe_float(cur_shares.get(etf_code_norm))
 
     prev_val = None
+    prev_source = ""
     if state_dir.exists():
         best_date = ""
         best_path: Optional[Path] = None
@@ -903,17 +1208,23 @@ def compute_share_change_from_snapshot(etf_code_norm: str) -> tuple[str, str]:
                 best_path = p
         if best_path:
             prev = _load_json(best_path)
+            prev_source = str(prev.get("source") or "").strip().lower() if isinstance(prev, dict) else ""
             prev_shares = prev.get("shares") if isinstance(prev, dict) else None
             if isinstance(prev_shares, dict):
                 prev_val = _safe_float(prev_shares.get(etf_code_norm))
     if prev_val is None:
         latest_path = state_dir / "etf_share_snapshot.json"
         prev = _load_json(latest_path) if latest_path.exists() else {}
+        prev_date = str(prev.get("date") or "") if isinstance(prev, dict) else ""
+        prev_source2 = str(prev.get("source") or "").strip().lower() if isinstance(prev, dict) else ""
         prev_shares = prev.get("shares") if isinstance(prev, dict) else None
-        if isinstance(prev_shares, dict):
+        if prev_date and prev_date < day and prev_source2 and prev_source2 == cur_source and isinstance(prev_shares, dict):
             prev_val = _safe_float(prev_shares.get(etf_code_norm))
+            prev_source = prev_source2
 
     if cur_val is None or prev_val is None:
+        return "", ""
+    if cur_source and prev_source and cur_source != prev_source:
         return "", ""
 
     delta = cur_val - prev_val
@@ -921,6 +1232,14 @@ def compute_share_change_from_snapshot(etf_code_norm: str) -> tuple[str, str]:
         return "不变", "0"
     direction = "增加" if delta > 0 else "减少"
     return direction, _fmt_num(abs(delta) / 10000.0)
+
+
+def _get_etf_share_for_turnover(etf_code_norm: str) -> Optional[float]:
+    shares, _ = snapshot_all_etf_shares()
+    v = _safe_float(shares.get(etf_code_norm))
+    if v is not None and v > 0:
+        return float(v)
+    return None
 
 
 def _eastmoney_market_from_code(code_norm: str) -> Optional[str]:
@@ -936,7 +1255,11 @@ def _eastmoney_market_from_code(code_norm: str) -> Optional[str]:
 def _eastmoney_stock_inflow_big_super_yuan(code_norm: str) -> Optional[float]:
     try:
         import akshare as ak  # type: ignore
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            "inflow_stock_import_akshare_failed",
+            f"Signal: 个股资金流 akshare 不可用，已降级为空。err={repr(e)}",
+        )
         return None
     mkt = _eastmoney_market_from_code(code_norm)
     if not mkt:
@@ -944,7 +1267,11 @@ def _eastmoney_stock_inflow_big_super_yuan(code_norm: str) -> Optional[float]:
     stock = code_norm.split(".")[0]
     try:
         df = ak.stock_individual_fund_flow(stock=stock, market=mkt)
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"inflow_stock_fetch_failed:{code_norm}",
+            f"Signal: 个股资金流拉取失败，已降级为空。code={code_norm} err={repr(e)}",
+        )
         return None
     if df is None or getattr(df, "empty", True):
         return None
@@ -956,17 +1283,29 @@ def _eastmoney_stock_inflow_big_super_yuan(code_norm: str) -> Optional[float]:
             return None
         return big + sup
     except Exception:
+        _warn_downgrade_once(
+            f"inflow_stock_parse_failed:{code_norm}",
+            f"Signal: 个股资金流解析失败，已降级为空。code={code_norm}",
+        )
         return None
 
 
 def _eastmoney_etf_inflow_big_super_yuan(etf_code_6: str) -> Optional[float]:
     try:
         import akshare as ak  # type: ignore
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            "inflow_etf_import_akshare_failed",
+            f"Signal: ETF资金流 akshare 不可用，已降级为空。err={repr(e)}",
+        )
         return None
     try:
         df = ak.fund_etf_spot_em()
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            "inflow_etf_fetch_failed",
+            f"Signal: ETF资金流拉取失败，已降级为空。err={repr(e)}",
+        )
         return None
     if df is None or getattr(df, "empty", True):
         return None
@@ -982,6 +1321,10 @@ def _eastmoney_etf_inflow_big_super_yuan(etf_code_6: str) -> Optional[float]:
             return main
         return big + sup
     except Exception:
+        _warn_downgrade_once(
+            f"inflow_etf_parse_failed:{etf_code_6}",
+            f"Signal: ETF资金流解析失败，已降级为空。etf={etf_code_6}",
+        )
         return None
 
 
@@ -1014,7 +1357,7 @@ def build_hot_search_text(items: list[NewsItem], *, max_items: int = 3) -> str:
     for i, it in enumerate(items[:max_items], start=1):
         ts = it.publish_time or it.crawl_time or ""
         body = (it.content or "").strip().replace("\n", " ")
-        summary = body[:120].strip()
+        summary = body
         if summary:
             summary = f"摘要：{summary}"
         out.append(f"{i}.[{ts}] [{it.title}]:[{summary}]")
@@ -1094,12 +1437,20 @@ def compute_etf_features(
     vol_ratio = (etf.volume[t] / (sum(vol_prev5) / len(vol_prev5))) if vol_prev5 and etf.volume[t] > 0 else None
 
     turnover_rank = None
+    turnover_rank_basis = "换手率分位"
+    turnover_rank_source = "xt_float_volume"
     try:
         float_vol = None
         if _xtdata_available():
             info = _xtdata.get_instrument_detail(etf_code, False)
             if isinstance(info, dict):
                 float_vol = _safe_float(info.get("FloatVolume"))
+        if float_vol is None or float_vol <= 0:
+            # xtdata on many SH ETFs returns FloatVolume=0; fallback to ETF share snapshots.
+            float_vol = _get_etf_share_for_turnover(etf_code)
+            if float_vol is not None and float_vol > 0:
+                turnover_rank_basis = "份额分位"
+                turnover_rank_source = "share_snapshot"
         if float_vol and float_vol > 0:
             turns = []
             for v in etf.volume[max(0, t - 19) : t + 1]:
@@ -1107,8 +1458,23 @@ def compute_etf_features(
                     turns.append(v / float_vol * 100.0)
             if turns:
                 turnover_rank = _percentile_rank(turns, turns[-1])
-    except Exception:
+        else:
+            turnover_rank_basis = "换手率/份额分位"
+            turnover_rank_source = "missing"
+    except Exception as e:
+        _warn_downgrade_once(
+            f"turnover_rank_failed:{etf_code}",
+            f"Signal: 换手分位计算失败，已降级为空。etf={etf_code} err={repr(e)}",
+        )
         turnover_rank = None
+        turnover_rank_basis = "换手率/份额分位"
+        turnover_rank_source = "error"
+
+    turnover_rank_text = (
+        f"{turnover_rank_basis}处于近 20 日 {_fmt_pct(turnover_rank)}% 分位"
+        if turnover_rank is not None
+        else f"{turnover_rank_basis}数据缺失"
+    )
 
     rsi_5 = _rsi([v for v in etf.close if math.isfinite(v)], 5)
     hist = _macd_hist([v for v in etf.close if math.isfinite(v)])
@@ -1132,7 +1498,11 @@ def compute_etf_features(
         atr10_y = _window_mean(tr, end_idx=t - 1, window=10) if t - 1 >= 0 else None
         if tr_today is not None and atr10_y is not None and atr10_y > 0:
             volatility_ratio = tr_today / atr10_y
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"volatility_ratio_failed:{etf_code}",
+            f"Signal: 波动率特征计算失败，已降级为空。etf={etf_code} err={repr(e)}",
+        )
         atr_status = ""
         volatility_ratio = None
 
@@ -1172,7 +1542,11 @@ def compute_etf_features(
             if avg_amt and avg_amt > 0:
                 market_vol_diff = (today_amt / avg_amt - 1.0) * 100.0
                 market_vol_status = "放量" if market_vol_diff > 0 else "缩量"
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"market_vol_feature_failed:{etf_code}",
+            f"Signal: 大盘量能特征计算失败，已降级为空。etf={etf_code} err={repr(e)}",
+        )
         market_vol_status = ""
         market_vol_diff = None
 
@@ -1202,6 +1576,9 @@ def compute_etf_features(
         "is_5d_highest": is_5d_highest,
         "vol_ratio": _fmt_num(vol_ratio),
         "turnover_rank": _fmt_pct(turnover_rank),
+        "turnover_rank_basis": turnover_rank_basis,
+        "turnover_rank_source": turnover_rank_source,
+        "turnover_rank_text": turnover_rank_text,
         "rsi_5": _fmt_num(rsi_5),
         "macd_trend": macd_trend,
         "macd_days": str(macd_days),
@@ -1225,6 +1602,34 @@ def compute_etf_features(
     }
 
 
+def _safe_run_etf_news_pipeline(
+    session: requests.Session,
+    deepseek: DeepSeekClient,
+    *,
+    etf_code: str,
+    etf_code_norm: str,
+    max_workers: Optional[int],
+    etf_source: str,
+    debug: bool,
+) -> dict[str, Any]:
+    try:
+        return run_etf_pipeline(
+            session,
+            deepseek,
+            etf_code=etf_code,
+            max_age_days=3,
+            etf_source=etf_source,
+            max_workers=max_workers,
+            debug=debug,
+        )
+    except Exception as e:
+        _warn_downgrade_once(
+            f"etf_news_pipeline_failed:{etf_code_norm}",
+            f"Signal: ETF news pipeline failed, downgraded to empty. etf={etf_code_norm} err={repr(e)}",
+        )
+        return {"top_3": [], "raw_news": [], "summaries": []}
+
+
 def run_etf_signal_pipeline(
     session: requests.Session,
     deepseek: DeepSeekClient,
@@ -1241,6 +1646,7 @@ def run_etf_signal_pipeline(
     timing: bool = False,
 ) -> dict[str, Any]:
     etf_code_norm = normalize_code(etf_code)
+    etf6 = etf_code_norm.split(".")[0]
     t0 = time.perf_counter()
     instrument_name = _xt_get_instrument_name(etf_code_norm) if _xtdata_available() else ""
     etf_source_effective = etf_source
@@ -1280,41 +1686,58 @@ def run_etf_signal_pipeline(
                             crawl_time=str(x.get("crawl_time") or ""),
                         )
                     )
-            except Exception:
+            except Exception as e:
+                _warn_downgrade_once(
+                    f"hot_cache_parse_failed:{hot_cache}",
+                    f"Signal: 热搜缓存解析失败，已降级实时拉取。path={hot_cache} err={repr(e)}",
+                )
                 hot_items = []
         else:
             try:
                 hot_items = fetch_top10_news(session, include_content=True, debug=debug)
-            except Exception:
+            except Exception as e:
+                _warn_downgrade_once(
+                    "hot_fetch_failed",
+                    f"Signal: 热搜拉取失败，已降级为空。err={repr(e)}",
+                )
                 hot_items = []
             try:
                 hot_cache.write_text(json.dumps([it.to_dict() for it in hot_items[:10]], ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_downgrade_once(
+                    f"hot_cache_write_failed:{hot_cache}",
+                    f"Signal: 热搜缓存写入失败，已降级继续。path={hot_cache} err={repr(e)}",
+                )
 
         hot_search_text = build_hot_search_text(hot_items, max_items=3)
 
-        etf6 = etf_code_norm.split(".")[0]
         etf_news_cache = cache_dir / f"etf_news_{etf6}_{day}.json"
         if etf_news_cache.exists():
             try:
                 holdings_news = json.loads(etf_news_cache.read_text(encoding="utf-8"))
-            except Exception:
+            except Exception as e:
+                _warn_downgrade_once(
+                    f"etf_news_cache_parse_failed:{etf_news_cache}",
+                    f"Signal: ETF新闻缓存解析失败，已降级实时拉取。path={etf_news_cache} err={repr(e)}",
+                )
                 holdings_news = {}
         else:
-            holdings_news = run_etf_pipeline(
+            holdings_news = _safe_run_etf_news_pipeline(
                 session,
                 deepseek,
-                etf_code=etf_code.strip(),
-                max_age_days=3,
+                etf_code=etf6,
+                etf_code_norm=etf_code_norm,
                 etf_source=etf_source_effective,
                 max_workers=max_workers,
                 debug=debug,
             )
             try:
                 etf_news_cache.write_text(json.dumps(holdings_news, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as e:
+                _warn_downgrade_once(
+                    f"etf_news_cache_write_failed:{etf_news_cache}",
+                    f"Signal: ETF新闻缓存写入失败，已降级继续。path={etf_news_cache} err={repr(e)}",
+                )
         news_text = build_etf_news_text(holdings_news, max_items=3)
         if timing:
             try:
@@ -1338,8 +1761,12 @@ def run_etf_signal_pipeline(
         etf_name_from_holdings = ""
         as_of_from_holdings = ""
         try:
-            etf_name_from_holdings, as_of_from_holdings, top10_holdings = fetch_etf_top10_holdings(session, etf_code.strip(), topline=10)
-        except Exception:
+            etf_name_from_holdings, as_of_from_holdings, top10_holdings = fetch_etf_top10_holdings(session, etf6, topline=10)
+        except Exception as e:
+            _warn_downgrade_once(
+                f"holdings_fetch_failed:{etf_code_norm}",
+                f"Signal: 权重股持仓拉取失败，已降级兜底。etf={etf_code_norm} err={repr(e)}",
+            )
             top10_holdings = []
         top5_holdings = top10_holdings[:5]
         if top5_holdings:
@@ -1408,6 +1835,21 @@ def run_etf_signal_pipeline(
     top5_kl: list[tuple[EtfHolding, Optional[KlineSeries]]] = []
     for h in top5_holdings:
         top5_kl.append((h, _pick_latest_kline_series(raw, normalize_code(h.stock_code)) if raw else None))
+
+    if etf_kl is None:
+        close_rows = 0
+        try:
+            close_df = raw.get("close") if isinstance(raw, dict) else None
+            if close_df is not None:
+                close_rows = int(len(close_df))
+        except Exception:
+            close_rows = 0
+        logging.getLogger(__name__).warning(
+            "Signal: 标的行情最终不可用，已降级为空K线模板。etf=%s requested_codes=%s close_rows=%s",
+            etf_code_norm,
+            len(codes),
+            close_rows,
+        )
 
     fields = (
         compute_etf_features(
@@ -1493,7 +1935,11 @@ def run_etf_signal_pipeline(
     try:
         if etf_kl is not None and etf_kl.close and math.isfinite(etf_kl.close[-1]):
             close_now = float(etf_kl.close[-1])
-    except Exception:
+    except Exception as e:
+        _warn_downgrade_once(
+            f"close_now_parse_failed:{etf_code_norm}",
+            f"Signal: close_now 解析失败，已降级为空。etf={etf_code_norm} err={repr(e)}",
+        )
         close_now = None
     fields.update(load_chip_factors(etf_code_norm, current_price=close_now))
 
@@ -1571,8 +2017,11 @@ def _extract_sentiment_struct(text: str) -> dict[str, object]:
                     grade = g
                 if c in {"HIGH", "MEDIUM", "LOW"}:
                     conf = c
-        except Exception:
-            pass
+        except Exception as e:
+            _warn_downgrade_once(
+                "sentiment_json_parse_failed",
+                f"Signal: SENTIMENT_JSON 解析失败，已降级默认评级。err={repr(e)}",
+            )
     score_01_map: dict[str, float] = {"A": 0.90, "B": 0.65, "C": 0.50, "D": 0.25, "E": 0.10}
     score_100_map: dict[str, int] = {"A": 85, "B": 70, "C": 50, "D": 30, "E": 15}
     base01 = float(score_01_map.get(grade, 0.50))

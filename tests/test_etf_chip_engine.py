@@ -100,7 +100,7 @@ class TestTickAdapter(unittest.TestCase):
         self.assertAlmostEqual(float(df.loc[1, "open"]), 1.0)
         self.assertAlmostEqual(float(df.loc[2, "open"]), 1.01)
         self.assertAlmostEqual(float(df.loc[0, "volume"]), 0.0)
-        self.assertAlmostEqual(float(df.loc[1, "volume"]), 40.0)
+        self.assertAlmostEqual(float(df.loc[1, "volume"]), 4000.0)
         self.assertAlmostEqual(float(df.loc[1, "amount"]), 20.0)
         self.assertAlmostEqual(float(df.loc[2, "volume"]), 0.0)
         self.assertAlmostEqual(float(df.loc[2, "amount"]), 0.0)

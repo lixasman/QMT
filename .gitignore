@@ -1,0 +1,40 @@
+.worktrees/
+.trae/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Local virtual environment
+qmt_env/
+
+# Generated runtime state and logs
+artifacts/
+backtest/data/
+backtest/data_probe/
+data/alerts/
+data/entry_events/
+data/exit*.jsonl
+data/logs/
+data/near_miss_events/
+data/state/
+data/state_review*.json
+output/
+
+# Generated market snapshot caches
+etf_chip_engine/data/chip_snapshots/
+etf_chip_engine/data/l1_snapshots/
+stock_chip_engine/data/chip_snapshots/
+tick_data/
+
+# Local debug / crash artifacts
+.tmp_*
+*.dmp
+crash.txt
+error.txt
+error_trace.txt
+myerr.txt
+pytest_err.txt
+pytest_out.txt
+sep_log.txt

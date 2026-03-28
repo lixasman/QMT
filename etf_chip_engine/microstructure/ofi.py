@@ -106,6 +106,7 @@ class ContStoikovOFI:
         microprice: np.ndarray | None = None,
         limit_locked_mask: pd.Series | None = None,
         valid_mask: pd.Series | None = None,
+        tick_size: float | None = None,
     ) -> OFIResult:
         """Compute OFI with shape features and quality diagnostics.
 
@@ -120,12 +121,24 @@ class ContStoikovOFI:
         valid_mask : pd.Series or None
             V2.1: valid_continuous_mask from M0. When False, OFI is set to
             NaN (excluding non-auction snapshots like lunch break).
+        tick_size : float or None
+            Price tick size for tick-integerization and divergence move gating.
+            Defaults to 0.001 when not provided.
         """
         if snapshots is None or getattr(snapshots, "empty", True):
             return _nan_ofi_result()
         required = {"bid1", "bid1_vol", "ask1", "ask1_vol"}
         if not required.issubset(set(snapshots.columns)):
             return _nan_ofi_result()
+
+        ts = TICK_SIZE
+        if tick_size is not None:
+            try:
+                ts_v = float(tick_size)
+            except Exception:
+                ts_v = 0.0
+            if np.isfinite(ts_v) and ts_v > 0:
+                ts = float(ts_v)
 
         bid_p = snapshots["bid1"].to_numpy(dtype=np.float64, copy=False)
         bid_v = snapshots["bid1_vol"].to_numpy(dtype=np.float64, copy=False)
@@ -164,10 +177,10 @@ class ContStoikovOFI:
             # Limit-locked snapshots: compute OFI contribution, but do NOT
             # include in ofi_daily aggregation; accumulate into queue_pressure.
             if limit_locked_mask is not None and limit_locked_mask.iloc[t]:
-                bp_prev = tick_integerize(bid_p[t - 1])
-                bp_curr = tick_integerize(bid_p[t])
-                ap_prev = tick_integerize(ask_p[t - 1])
-                ap_curr = tick_integerize(ask_p[t])
+                bp_prev = tick_integerize(bid_p[t - 1], tick_size=ts)
+                bp_curr = tick_integerize(bid_p[t], tick_size=ts)
+                ap_prev = tick_integerize(ask_p[t - 1], tick_size=ts)
+                ap_curr = tick_integerize(ask_p[t], tick_size=ts)
 
                 if bp_curr > bp_prev:
                     e_bid = bid_v[t]
@@ -205,10 +218,10 @@ class ContStoikovOFI:
                 continue
 
             # Stoikov OFI with tick-integerized price comparison
-            bp_prev = tick_integerize(bid_p[t - 1])
-            bp_curr = tick_integerize(bid_p[t])
-            ap_prev = tick_integerize(ask_p[t - 1])
-            ap_curr = tick_integerize(ask_p[t])
+            bp_prev = tick_integerize(bid_p[t - 1], tick_size=ts)
+            bp_curr = tick_integerize(bid_p[t], tick_size=ts)
+            ap_prev = tick_integerize(ask_p[t - 1], tick_size=ts)
+            ap_curr = tick_integerize(ask_p[t], tick_size=ts)
 
             if bp_curr > bp_prev:
                 e_bid = bid_v[t]
@@ -286,7 +299,7 @@ class ContStoikovOFI:
             if n_finite >= OFI_DIVERGENCE_MIN_SAMPLES:
                 dm_finite = dm[finite]
                 # Second gate: minimum price moves
-                n_moves = int(np.sum(np.abs(dm_finite) >= TICK_SIZE))
+                n_moves = int(np.sum(np.abs(dm_finite) >= ts))
                 if n_moves >= OFI_DIVERGENCE_MIN_MOVES:
                     ofi_f = ofi_for_corr[finite]
                     rho = np.corrcoef(ofi_f, dm_finite)

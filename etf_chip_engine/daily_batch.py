@@ -11,8 +11,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.warn_utils import warn_once
+from etf_chip_engine.config import CONFIG
 from etf_chip_engine.data.xtdata_provider import cleanup_xtdata_dated_files, cleanup_xtdata_trade_date_files, latest_trade_date, prev_trade_date, require_xtdata
 from etf_chip_engine.service import IndustryETFChipService
+
+
+DEFAULT_RETENTION_DAYS = 0
 
 
 def _resolve_trade_date(date_arg: str) -> str:
@@ -47,7 +51,10 @@ def _zones_to_json(v: Any) -> str:
                 obj2 = ast.literal_eval(s)
                 return json.dumps(obj2, ensure_ascii=False, separators=(",", ":"))
             except Exception:
-                warn_once(f"zones_parse_failed:{s[:80]}", f"Integration: dense_zones 解析失败，已降级为空数组: {s[:160]}")
+                warn_once(
+                    f"zones_parse_failed:{s[:80]}",
+                    f"Integration: dense_zones parse failed, downgraded to empty array: {s[:160]}",
+                )
                 return "[]"
     if isinstance(v, (list, dict)):
         try:
@@ -115,19 +122,64 @@ def _max_density_price(v: Any, *, zone_type: str) -> Optional[float]:
     return best_p
 
 
+def _factor_history_dirs() -> list[Path]:
+    out: list[Path] = []
+    ms_cfg = CONFIG.get("microstructure")
+    if isinstance(ms_cfg, dict):
+        raw = str(ms_cfg.get("factor_history_dir", "") or "").strip()
+        if raw:
+            out.append(Path(raw))
+    legacy = Path("etf_chip_engine") / "data" / "factor_history"
+    if not out:
+        out.append(legacy)
+    elif legacy not in out:
+        out.append(legacy)
+    return out
+
+
+def _count_history_rows(path: Path) -> Optional[int]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        try:
+            n = 0
+            with path.open("r", encoding="utf-8") as f:
+                for _ in f:
+                    n += 1
+            return int(max(0, n - 1))
+        except Exception as e:
+            warn_once(
+                f"factor_history_read_failed:{str(path)}",
+                f"Integration: factor_history read failed, downgraded to 0 days: {path} err={repr(e)}",
+                logger_name=__name__,
+            )
+            return None
+
+    if suffix == ".parquet":
+        try:
+            import pyarrow.parquet as pq  # type: ignore
+
+            return int(max(0, pq.ParquetFile(path).metadata.num_rows))
+        except Exception as e:
+            warn_once(
+                f"factor_history_parquet_read_failed:{str(path)}",
+                f"Integration: factor_history parquet read failed, downgraded to 0 days: {path} err={repr(e)}",
+                logger_name=__name__,
+            )
+            return None
+    return None
+
+
 def _count_factor_history_days(*, code: str) -> int:
-    p = Path("etf_chip_engine") / "data" / "factor_history" / f"{code.replace('.', '_')}.csv"
-    if not p.exists():
-        return 0
-    try:
-        n = 0
-        with p.open("r", encoding="utf-8") as f:
-            for _ in f:
-                n += 1
-        return int(max(0, n - 1))
-    except Exception as e:
-        warn_once(f"factor_history_read_failed:{str(p)}", f"Integration: factor_history 读取失败，已降级为 0 天: {p} err={repr(e)}")
-        return 0
+    key = code.replace(".", "_")
+    for d in _factor_history_dirs():
+        for ext in (".csv", ".parquet"):
+            p = d / f"{key}{ext}"
+            if not p.exists():
+                continue
+            rows = _count_history_rows(p)
+            if rows is not None:
+                return int(max(0, rows))
+    return 0
 
 
 @dataclass(frozen=True)
@@ -201,7 +253,7 @@ def _cleanup_dated_paths(
         except Exception as e:
             warn_once(
                 f"retention_cleanup_failed:{str(p)}",
-                f"Retention: 清理过期文件失败，已降级跳过: path={p} err={repr(e)}",
+                f"Retention: failed to clean expired files, downgraded skip: path={p} err={repr(e)}",
             )
     return {
         "checked": int(len(entries)),
@@ -277,7 +329,7 @@ def _collect_tick_state_entries(root: Path) -> list[tuple[Path, date]]:
 
 def _apply_data_retention(
     *,
-    keep_days: int = 365,
+    keep_days: int = DEFAULT_RETENTION_DAYS,
     today: Optional[date] = None,
     base_dir: str | Path = ".",
 ) -> dict[str, Any]:
@@ -311,7 +363,10 @@ def _apply_data_retention(
     try:
         stats["xtdata"] = cleanup_xtdata_dated_files(keep_days=keep_i, today=today_d)
     except Exception as e:
-        warn_once("retention_xtdata_cleanup_failed", f"Retention: xtdata 清理失败，已降级跳过: err={repr(e)}")
+        warn_once(
+            "retention_xtdata_cleanup_failed",
+            f"Retention: xtdata cleanup failed, downgraded skip: err={repr(e)}",
+        )
         stats["xtdata"] = {
             "enabled": True,
             "keep_days": int(keep_i),
@@ -329,14 +384,28 @@ def run_daily_batch(
     codes: Optional[list[str]] = None,
     l1_csv: bool = False,
     force_download: bool = False,
-    retention_days: int = 365,
+    cleanup_trade_date_tick: bool = False,
+    retention_days: int = DEFAULT_RETENTION_DAYS,
+    industry_etf_min_a_share_ratio: Optional[float] = None,
+    industry_etf_max_constituents: Optional[int] = None,
+    liquidity_prefilter_enabled: Optional[bool] = None,
     out: str | Path | None = None,
 ) -> Path:
     t0 = time.perf_counter()
     require_xtdata()
     td = _resolve_trade_date(str(trade_date))
 
-    svc = IndustryETFChipService(config={"l1_fallback_csv": "1"} if bool(l1_csv) else None)
+    svc_cfg: dict[str, object] = {}
+    if bool(l1_csv):
+        svc_cfg["l1_fallback_csv"] = "1"
+    if industry_etf_min_a_share_ratio is not None:
+        svc_cfg["industry_etf_min_a_share_ratio"] = float(industry_etf_min_a_share_ratio)
+    if industry_etf_max_constituents is not None:
+        svc_cfg["industry_etf_max_constituents"] = int(industry_etf_max_constituents)
+    if liquidity_prefilter_enabled is not None:
+        svc_cfg["liquidity_prefilter_enabled"] = 1 if bool(liquidity_prefilter_enabled) else 0
+
+    svc = IndustryETFChipService(config=(svc_cfg or None))
     t1 = time.perf_counter()
     df = svc.run_daily(td, limit=limit, codes=codes, force_download=bool(force_download))
     t2 = time.perf_counter()
@@ -369,19 +438,43 @@ def run_daily_batch(
     except Exception:
         pass
     t4 = time.perf_counter()
-    try:
-        cleanup_trade_date_stats = cleanup_xtdata_trade_date_files(trade_date=str(td))
-    except Exception as e:
-        warn_once("xtdata_trade_date_cleanup_failed", f"XtData: 清理当日 tick 缓存失败，已降级跳过: trade_date={td} err={repr(e)}")
+    cleanup_trade_date_stats: dict[str, Any]
+    if bool(cleanup_trade_date_tick):
+        try:
+            cleanup_trade_date_stats = cleanup_xtdata_trade_date_files(trade_date=str(td))
+        except Exception as e:
+            warn_once(
+                "xtdata_trade_date_cleanup_failed",
+                f"XtData: failed to clean same-day tick cache, downgraded skip: trade_date={td} err={repr(e)}",
+            )
+            cleanup_trade_date_stats = {
+                "enabled": True,
+                "trade_date": str(td),
+                "removed_files": 0,
+                "removed_bytes": 0,
+                "error": repr(e),
+            }
+    else:
         cleanup_trade_date_stats = {
-            "enabled": True,
+            "enabled": False,
             "trade_date": str(td),
             "removed_files": 0,
             "removed_bytes": 0,
-            "error": repr(e),
+            "reason": "disabled",
         }
     t4b = time.perf_counter()
-    retention_stats = _apply_data_retention(keep_days=int(retention_days))
+    retention_days_i = int(max(int(retention_days), 0))
+    if retention_days_i > 0:
+        retention_stats = _apply_data_retention(keep_days=retention_days_i)
+    else:
+        retention_stats = {
+            "enabled": False,
+            "keep_days": int(retention_days_i),
+            "today": datetime.now().date().strftime("%Y%m%d"),
+            "project": {},
+            "xtdata": {},
+            "reason": "disabled",
+        }
     t5 = time.perf_counter()
 
     print(
@@ -391,7 +484,17 @@ def run_daily_batch(
                 "trade_date": str(td),
                 "rows": int(len(df)),
                 "force_download": bool(force_download),
-                "retention_days": int(retention_days),
+                "cleanup_trade_date_tick": bool(cleanup_trade_date_tick),
+                "retention_days": int(retention_days_i),
+                "industry_etf_min_a_share_ratio": (
+                    None if industry_etf_min_a_share_ratio is None else float(industry_etf_min_a_share_ratio)
+                ),
+                "industry_etf_max_constituents": (
+                    None if industry_etf_max_constituents is None else int(industry_etf_max_constituents)
+                ),
+                "liquidity_prefilter_enabled": (
+                    None if liquidity_prefilter_enabled is None else bool(liquidity_prefilter_enabled)
+                ),
                 "xtdata_trade_date_cleanup": cleanup_trade_date_stats,
                 "retention": retention_stats,
                 "seconds": {
@@ -418,21 +521,55 @@ def main() -> int:
     parser.add_argument("--code", default="")
     parser.add_argument("--l1-csv", action="store_true")
     parser.add_argument("--force-download", action="store_true")
-    parser.add_argument("--retention-days", default="365")
+    parser.add_argument("--cleanup-trade-date-tick", action="store_true", help="clean same-day xtdata tick files after batch (default: disabled)")
+    parser.add_argument(
+        "--retention-days",
+        default=str(DEFAULT_RETENTION_DAYS),
+        help="delete expired historical artifacts only when > 0; default: 0 (disabled)",
+    )
+    parser.add_argument(
+        "--industry-etf-min-a-share-ratio",
+        default="",
+        help="override service admission filter threshold, e.g. 0.0 to disable A-share ratio filter",
+    )
+    parser.add_argument(
+        "--industry-etf-max-constituents",
+        default="",
+        help="override service admission filter constituent cap, e.g. 0 to disable",
+    )
+    parser.add_argument(
+        "--liquidity-prefilter-enabled",
+        default="",
+        help="override liquidity prefilter switch: 1/0/true/false",
+    )
     args = parser.parse_args()
 
     lim = int(str(args.limit).strip() or "0")
-    retention_days = int(str(args.retention_days).strip() or "365")
+    retention_days = int(str(args.retention_days).strip() or str(DEFAULT_RETENTION_DAYS))
     code = str(args.code).strip()
     codes = [code] if code else None
     trade_date = _resolve_trade_date(str(args.date))
+    min_a_share_ratio: Optional[float] = None
+    if str(args.industry_etf_min_a_share_ratio).strip():
+        min_a_share_ratio = float(str(args.industry_etf_min_a_share_ratio).strip())
+    max_constituents: Optional[int] = None
+    if str(args.industry_etf_max_constituents).strip():
+        max_constituents = int(str(args.industry_etf_max_constituents).strip())
+    liq_prefilter_enabled: Optional[bool] = None
+    if str(args.liquidity_prefilter_enabled).strip():
+        s = str(args.liquidity_prefilter_enabled).strip().lower()
+        liq_prefilter_enabled = s in {"1", "true", "t", "yes", "y", "on"}
     out_path = run_daily_batch(
         trade_date=trade_date,
         limit=(lim if lim > 0 else None),
         codes=codes,
         l1_csv=bool(args.l1_csv),
         force_download=bool(args.force_download),
+        cleanup_trade_date_tick=bool(args.cleanup_trade_date_tick),
         retention_days=int(max(retention_days, 0)),
+        industry_etf_min_a_share_ratio=min_a_share_ratio,
+        industry_etf_max_constituents=max_constituents,
+        liquidity_prefilter_enabled=liq_prefilter_enabled,
         out=(str(args.out).strip() or None),
     )
     print("trade_date", trade_date)
@@ -442,3 +579,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

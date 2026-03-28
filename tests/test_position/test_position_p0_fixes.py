@@ -8,7 +8,7 @@ from typing import Any
 
 from core.enums import DataQuality, FSMState, OrderStatus
 from core.interfaces import InstrumentInfo, OrderRequest, OrderResult, TickSnapshot
-from core.models import PortfolioState, PositionState
+from core.models import PendingSell, PortfolioState, PositionState
 from core.state_manager import StateManager
 
 from position.position_fsm import PositionFSM
@@ -133,6 +133,88 @@ def test_p0_entry_date_cleared_on_s0(tmp_path: Path) -> None:
     pf.positions["512480"].entry_date = "2026-01-02"
     fsm.on_layer1_clear("512480", sold_qty=0)
     assert pf.positions["512480"].entry_date == ""
+
+
+def test_p0_layer1_clear_keeps_lifeboat_context_when_locked_qty_remains(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    pf = PortfolioState()
+    pf.positions["512480"] = PositionState(
+        etf_code="512480",
+        state=FSMState.S2_BASE,
+        total_qty=10000,
+        base_qty=10000,
+        avg_cost=1.0,
+        highest_high=1.2,
+        entry_date="2026-01-02",
+        lifeboat_used=True,
+        lifeboat_sell_time="2026-02-23T10:00:00",
+        lifeboat_tight_stop=0.95,
+        last_lifeboat_buyback_date="2026-02-23",
+        pending_sell_locked=[
+            PendingSell(etf_code="512480", locked_qty=6000, lock_reason="T1_LOCKED", sell_at="0930", sell_price_type="LAYER1", created_time="2026-02-23T10:00:00")
+        ],
+    )
+    fsm = PositionFSM(
+        state_manager=sm,
+        data=_FakeData(bid1=1.0),
+        trading=_FakeTrading(filled_qty=0, avg_price=0.0),
+        state=pf,
+        log_path=str(tmp_path / "log.jsonl"),
+    )
+
+    fsm.on_layer1_clear("512480", sold_qty=4000)
+    ps = pf.positions["512480"]
+    assert ps.state == FSMState.S5_REDUCED
+    assert ps.total_qty == 6000
+    assert ps.base_qty == 6000
+    assert ps.avg_cost == 1.0
+    assert ps.highest_high == 1.2
+    assert ps.entry_date == "2026-01-02"
+    assert ps.lifeboat_used is True
+    assert ps.lifeboat_sell_time == "2026-02-23T10:00:00"
+    assert ps.lifeboat_tight_stop == 0.95
+    assert ps.last_lifeboat_buyback_date == "2026-02-23"
+
+
+def test_p0_lifeboat_rebuy_restores_reduced_state_to_s4_full(tmp_path: Path) -> None:
+    sm = StateManager(tmp_path / "state.json")
+    pf = PortfolioState()
+    pf.positions["512480"] = PositionState(
+        etf_code="512480",
+        state=FSMState.S5_REDUCED,
+        total_qty=3000,
+        base_qty=3000,
+        avg_cost=1.0,
+        t0_frozen=True,
+        lifeboat_used=False,
+        lifeboat_sell_time="2026-02-23T10:00:00",
+        lifeboat_tight_stop=0.95,
+    )
+    log_path = tmp_path / "log.jsonl"
+    fsm = PositionFSM(
+        state_manager=sm,
+        data=_FakeData(bid1=1.0),
+        trading=_FakeTrading(filled_qty=0, avg_price=0.0),
+        state=pf,
+        log_path=str(log_path),
+    )
+
+    fsm.on_lifeboat_rebuy("512480", rebuy_qty=7000, rebuy_price=0.95)
+
+    ps = pf.positions["512480"]
+    assert ps.state == FSMState.S4_FULL
+    assert ps.total_qty == 10000
+    assert ps.base_qty == 10000
+    assert ps.scale_1_qty == 0
+    assert ps.scale_2_qty == 0
+    assert abs(float(ps.avg_cost) - 0.965) < 1e-9
+
+    lines = Path(log_path).read_text(encoding="utf-8").strip().splitlines()
+    last = json.loads(lines[-1])
+    assert last["type"] == "FSM_TRANSITION"
+    assert last["from_state"] == "S5"
+    assert last["to_state"] == "S4"
+    assert last["trigger"] == "LIFEBOAT_REBUY"
 
 
 def test_p0_execute_scale_partial_fill_no_transition(tmp_path: Path) -> None:

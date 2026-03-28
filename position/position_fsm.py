@@ -9,8 +9,9 @@ from core.enums import FSMState, OrderSide, OrderStatus, OrderTimeInForce, Order
 from core.interfaces import DataAdapter, OrderRequest, TradingAdapter
 from core.models import PortfolioState, PositionState, T0TradeRecord
 from core.state_manager import StateManager
+from core.warn_utils import degrade_once
 
-from exit.exit_fsm import EXIT_MUTEX, _extract_etf_code, _extract_sellable_qty, _extract_total_qty
+from exit.exit_fsm import EXIT_MUTEX, _extract_avg_cost, _extract_etf_code, _extract_sellable_qty, _extract_total_qty
 from t0 import T0Engine
 from t0.breaker import BreakerInputs, evaluate_breakers, update_consecutive_loss_count
 from t0.constants import T0_ORDER_AMOUNT_MAX, T0_ORDER_AMOUNT_MIN, T0_QUOTA_BASE_RATIO
@@ -43,6 +44,7 @@ class PositionFSM:
         mutex: threading.Lock = EXIT_MUTEX,
         t0_log_path: str = "data/logs/t0_decisions.jsonl",
         t0_engine: Optional[T0Engine] = None,
+        enable_t0: bool = False,
     ) -> None:
         self._sm = state_manager
         self._data = data
@@ -53,6 +55,9 @@ class PositionFSM:
         self._t0_log_path = str(t0_log_path)
         self._t0_engine = t0_engine or T0Engine(data=data, trading=trading, log_path=str(t0_log_path), position_port=self)
         self._t0_orders = OrderManager()
+        self._enable_t0 = bool(enable_t0)
+        self._startup_recovered_codes: set[str] = set()
+        self._startup_recovered_cost_codes: set[str] = set()
 
     @property
     def state(self) -> PortfolioState:
@@ -69,22 +74,208 @@ class PositionFSM:
             self._state.positions[code] = ps
         return ps
 
+    @staticmethod
+    def _normalized_same_day_buy_qty(*, ps: Optional[PositionState], total_qty: int) -> int:
+        if ps is None:
+            return 0
+        total = max(0, int(total_qty))
+        locked = max(0, int(getattr(ps, "same_day_buy_qty", 0) or 0))
+        return int(min(int(total), int(locked)))
+
+    def _effective_sellable_qty(self, *, ps: Optional[PositionState], total_qty: int, broker_sellable_qty: int) -> int:
+        total = max(0, int(total_qty))
+        broker_sellable = max(0, int(broker_sellable_qty))
+        if self._enable_t0:
+            return int(min(int(total), int(broker_sellable)))
+        local_locked = self._normalized_same_day_buy_qty(ps=ps, total_qty=int(total))
+        capped = max(0, int(total) - int(local_locked))
+        return int(min(int(broker_sellable), int(capped)))
+
     def query_balances(self, *, etf_code: str) -> tuple[int, int, int]:
         code = str(etf_code)
         raw = self._trading.query_positions()
         total = 0
-        sellable = 0
+        broker_sellable = 0
         for p in raw:
             c = _extract_etf_code(p)
             if str(c) != code:
                 continue
             total = int(_extract_total_qty(p))
-            sellable = int(_extract_sellable_qty(p))
+            broker_sellable = int(_extract_sellable_qty(p))
             break
+        ps = self._state.positions.get(code)
+        sellable = self._effective_sellable_qty(ps=ps, total_qty=int(total), broker_sellable_qty=int(broker_sellable))
         locked = int(total) - int(sellable)
         if locked < 0:
             locked = 0
         return int(total), int(sellable), int(locked)
+
+    def _normalize_position_lots(self, *, ps: PositionState, total_qty: int) -> None:
+        total = max(0, int(total_qty))
+        base = min(max(0, int(ps.base_qty)), int(total))
+        rest = int(total) - int(base)
+        s1 = min(max(0, int(ps.scale_1_qty)), int(rest))
+        rest -= int(s1)
+        s2 = min(max(0, int(ps.scale_2_qty)), int(rest))
+        ps.base_qty = int(base)
+        ps.scale_1_qty = int(s1)
+        ps.scale_2_qty = int(s2)
+        ps.total_qty = int(total)
+        ps.same_day_buy_qty = self._normalized_same_day_buy_qty(ps=ps, total_qty=int(total))
+
+    def _recover_position_from_broker(
+        self,
+        *,
+        ps: PositionState,
+        total_qty: int,
+        avg_cost: float,
+        pending_status: str,
+        pending_price: float,
+        recovered_missing_local: bool,
+    ) -> None:
+        total = max(0, int(total_qty))
+        px = float(avg_cost) if float(avg_cost) > 0 else float(pending_price)
+        prev_state = ps.state
+        prev_total = int(ps.total_qty)
+        ps.total_qty = int(total)
+        if float(px) > 0:
+            ps.avg_cost = float(px)
+
+        if pending_status in ("TRIAL_PLACED", "PENDING_CONFIRM"):
+            ps.state = FSMState.S1_TRIAL
+            ps.base_qty = 0
+            ps.scale_1_qty = 0
+            ps.scale_2_qty = 0
+            ps.same_day_buy_qty = int(total)
+            return
+
+        if pending_status == "CONFIRM_PLACED":
+            ps.state = FSMState.S2_BASE
+            ps.base_qty = int(total)
+            ps.scale_1_qty = 0
+            ps.scale_2_qty = 0
+            ps.same_day_buy_qty = int(total)
+            return
+
+        if recovered_missing_local or prev_total <= 0 or prev_state == FSMState.S0_IDLE:
+            ps.state = FSMState.S2_BASE
+            ps.base_qty = int(total)
+            ps.scale_1_qty = 0
+            ps.scale_2_qty = 0
+            ps.same_day_buy_qty = 0
+            return
+
+        self._normalize_position_lots(ps=ps, total_qty=int(total))
+        if int(ps.total_qty) > 0 and ps.state == FSMState.S0_IDLE:
+            ps.state = FSMState.S2_BASE
+            ps.base_qty = int(total)
+            ps.scale_1_qty = 0
+            ps.scale_2_qty = 0
+        ps.same_day_buy_qty = self._normalized_same_day_buy_qty(ps=ps, total_qty=int(total))
+
+    def recover_on_startup(self) -> None:
+        with self._mutex:
+            self._startup_recovered_codes = set()
+            self._startup_recovered_cost_codes = set()
+            pending_by_code: dict[str, tuple[str, float]] = {}
+            for pe in list(self._state.pending_entries):
+                code = str(getattr(pe, "etf_code", "") or "")
+                if not code:
+                    continue
+                st = str(getattr(pe, "status", "") or "")
+                price = 0.0
+                if st == "CONFIRM_PLACED":
+                    price = float(getattr(pe, "confirm_price", 0.0) or 0.0)
+                elif st in ("TRIAL_PLACED", "PENDING_CONFIRM"):
+                    price = float(getattr(pe, "trial_price", 0.0) or 0.0)
+                if st:
+                    pending_by_code[code] = (st, float(price))
+
+            try:
+                raw_positions = list(self._trading.query_positions())
+            except Exception as e:
+                for code, ps in list(self._state.positions.items()):
+                    ps.total_qty = int(ps.total_qty)
+                    if ps.pending_sell_locked:
+                        ps.pending_sell_locked = [p for p in ps.pending_sell_locked if int(p.locked_qty) > 0]
+                    if ps.pending_sell_unfilled:
+                        ps.pending_sell_unfilled = [p for p in ps.pending_sell_unfilled if int(p.locked_qty) > 0]
+                    degrade_once(
+                        f"startup_position_reconcile_failed:{str(code)}",
+                        f"startup position reconcile failed; keep local state as-is. etf={code} err={repr(e)}",
+                    )
+                self.save()
+                return
+
+            broker_by_code: dict[str, tuple[int, int, float]] = {}
+            for row in raw_positions:
+                code = str(_extract_etf_code(row) or "")
+                if not code:
+                    continue
+                broker_by_code[code] = (
+                    int(_extract_total_qty(row)),
+                    int(_extract_sellable_qty(row)),
+                    float(_extract_avg_cost(row) or 0.0),
+                )
+
+            for code, ps in list(self._state.positions.items()):
+                ps.total_qty = int(ps.total_qty)
+                if ps.pending_sell_locked:
+                    ps.pending_sell_locked = [p for p in ps.pending_sell_locked if int(p.locked_qty) > 0]
+                if ps.pending_sell_unfilled:
+                    ps.pending_sell_unfilled = [p for p in ps.pending_sell_unfilled if int(p.locked_qty) > 0]
+                snap = broker_by_code.get(str(code))
+                if snap is None:
+                    degrade_once(
+                        f"startup_position_snapshot_missing_keep_local:{str(code)}",
+                        f"startup broker position snapshot missing code; keep local state as-is. etf={code}",
+                    )
+                    continue
+                total, _sellable, avg_cost = snap
+                if int(total) > 0:
+                    pending_status, pending_price = pending_by_code.get(str(code), ("", 0.0))
+                    self._recover_position_from_broker(
+                        ps=ps,
+                        total_qty=int(total),
+                        avg_cost=float(avg_cost),
+                        pending_status=str(pending_status),
+                        pending_price=float(pending_price),
+                        recovered_missing_local=False,
+                    )
+                    self._startup_recovered_codes.add(str(code))
+                    if float(avg_cost) > 0:
+                        self._startup_recovered_cost_codes.add(str(code))
+                    continue
+                if int(ps.total_qty) > 0 or ps.state != FSMState.S0_IDLE:
+                    degrade_once(
+                        f"startup_stale_local_position_cleared:{str(code)}",
+                        f"startup cleared stale local position because broker reports flat. etf={code} local_state={ps.state.value} local_qty={int(ps.total_qty)}",
+                    )
+                self._state.positions.pop(str(code), None)
+                self._startup_recovered_codes.discard(str(code))
+                self._startup_recovered_cost_codes.discard(str(code))
+
+            for code, snap in broker_by_code.items():
+                if str(code) in self._state.positions:
+                    continue
+                total, _sellable, avg_cost = snap
+                if int(total) <= 0:
+                    continue
+                ps = PositionState(etf_code=str(code))
+                pending_status, pending_price = pending_by_code.get(str(code), ("", 0.0))
+                self._recover_position_from_broker(
+                    ps=ps,
+                    total_qty=int(total),
+                    avg_cost=float(avg_cost),
+                    pending_status=str(pending_status),
+                    pending_price=float(pending_price),
+                    recovered_missing_local=True,
+                )
+                self._state.positions[str(code)] = ps
+                self._startup_recovered_codes.add(str(code))
+                if float(avg_cost) > 0:
+                    self._startup_recovered_cost_codes.add(str(code))
+            self.save()
 
     def on_trial_filled(self, etf_code: str, qty: int, price: float) -> None:
         code = str(etf_code)
@@ -103,6 +294,7 @@ class PositionFSM:
             ps.total_qty = int(new_qty)
             ps.avg_cost = float(new_avg)
             ps.state = FSMState.S1_TRIAL
+            ps.same_day_buy_qty = int(ps.same_day_buy_qty) + int(q)
             if not ps.entry_date:
                 ps.entry_date = now.strftime("%Y-%m-%d")
             log_fsm_transition(
@@ -136,6 +328,7 @@ class PositionFSM:
             ps.base_qty = int(new_qty)
             ps.avg_cost = float(new_avg)
             ps.state = FSMState.S2_BASE
+            ps.same_day_buy_qty = int(ps.same_day_buy_qty) + int(q)
             log_fsm_transition(
                 log_path=self._log_path,
                 timestamp=now,
@@ -175,6 +368,7 @@ class PositionFSM:
             ps.lifeboat_used = False
             ps.lifeboat_sell_time = ""
             ps.auction_volume_history = []
+            ps.same_day_buy_qty = 0
             log_fsm_transition(
                 log_path=self._log_path,
                 timestamp=now,
@@ -235,6 +429,7 @@ class PositionFSM:
             ps.scale_1_qty = int(s1)
             ps.scale_2_qty = int(s2)
             ps.total_qty = int(new_total)
+            ps.same_day_buy_qty = self._normalized_same_day_buy_qty(ps=ps, total_qty=int(new_total))
             log_fsm_transition(
                 log_path=self._log_path,
                 timestamp=now,
@@ -258,37 +453,52 @@ class PositionFSM:
                 return
             _ = check_transition(current_state=ps.state, new_state=FSMState.S0_IDLE, trigger="LAYER1_CLEAR")
             prev_state = ps.state
-            ps.total_qty = max(0, int(ps.total_qty) - int(q))
+            new_total = max(0, int(ps.total_qty) - int(q))
+            ps.total_qty = int(new_total)
             pending_locked = list(ps.pending_sell_locked)
             pending_unfilled = list(ps.pending_sell_unfilled)
-            ps.state = FSMState.S0_IDLE
-            ps.base_qty = 0
-            ps.scale_1_qty = 0
-            ps.scale_2_qty = 0
-            ps.avg_cost = 0.0
-            ps.effective_slot = 0.0
-            ps.scale_count = 0
-            ps.last_scale_date = ""
-            ps.t0_frozen = False
-            ps.t0_max_exposure = 0.0
-            ps.highest_high = 0.0
-            ps.entry_date = ""
-            ps.cooldown_until = ""
-            ps.lifeboat_used = False
-            ps.lifeboat_sell_time = ""
-            ps.auction_volume_history = []
-            ps.t0_trades = []
+            if int(new_total) > 0:
+                # A Layer1 sell can still leave T+1-locked residual shares. Keep the economic
+                # wave context so the remainder cannot re-enter a fresh lifeboat cycle intraday.
+                ps.state = FSMState.S5_REDUCED
+                ps.base_qty = int(new_total)
+                ps.scale_1_qty = 0
+                ps.scale_2_qty = 0
+                ps.t0_frozen = True
+                ps.t0_max_exposure = 0.0
+            else:
+                ps.state = FSMState.S0_IDLE
+                ps.base_qty = 0
+                ps.scale_1_qty = 0
+                ps.scale_2_qty = 0
+                ps.avg_cost = 0.0
+                ps.effective_slot = 0.0
+                ps.scale_count = 0
+                ps.last_scale_date = ""
+                ps.t0_frozen = False
+                ps.t0_max_exposure = 0.0
+                ps.highest_high = 0.0
+                ps.entry_date = ""
+                ps.cooldown_until = ""
+                ps.lifeboat_used = False
+                ps.lifeboat_sell_time = ""
+                ps.lifeboat_tight_stop = 0.0
+                ps.last_lifeboat_buyback_date = ""
+                ps.auction_volume_history = []
+                ps.t0_trades = []
+                ps.same_day_buy_qty = 0
             ps.pending_sell_locked = pending_locked
             ps.pending_sell_unfilled = pending_unfilled
+            ps.same_day_buy_qty = self._normalized_same_day_buy_qty(ps=ps, total_qty=int(new_total))
             log_fsm_transition(
                 log_path=self._log_path,
                 timestamp=now,
                 payload={
                     "etf_code": code,
                     "from_state": str(prev_state.value),
-                    "to_state": "S0",
+                    "to_state": str(ps.state.value),
                     "trigger": "LAYER1_CLEAR",
-                    "details": {"sold_qty": int(q)},
+                    "details": {"sold_qty": int(q), "remaining_qty": int(new_total)},
                 },
             )
             self.save()
@@ -300,22 +510,28 @@ class PositionFSM:
         now = datetime.now()
         with self._mutex:
             ps = self.upsert_position(etf_code=code)
+            prev_state = ps.state
+            if ps.state == FSMState.S5_REDUCED:
+                _ = check_transition(current_state=ps.state, new_state=FSMState.S4_FULL, trigger="LIFEBOAT_REBUY")
+                ps.state = FSMState.S4_FULL
             prev_total = int(ps.total_qty)
             prev_avg = float(ps.avg_cost)
             ps.total_qty = int(prev_total) + int(q)
             # 回补股份计入底仓 (exit spec L92-94: 70% 新股属底仓)
             ps.base_qty = int(ps.base_qty) + int(q)
+            ps.same_day_buy_qty = int(ps.same_day_buy_qty) + int(q)
             # 加权平均成本更新
             if px > 0 and int(ps.total_qty) > 0:
                 old_cost = float(prev_avg) * int(prev_total) if prev_avg > 0 else 0.0
                 new_cost = float(px) * int(q)
                 ps.avg_cost = float((old_cost + new_cost) / int(ps.total_qty))
+            ps.last_lifeboat_buyback_date = now.strftime("%Y-%m-%d")
             log_fsm_transition(
                 log_path=self._log_path,
                 timestamp=now,
                 payload={
                     "etf_code": code,
-                    "from_state": str(ps.state.value),
+                    "from_state": str(prev_state.value),
                     "to_state": str(ps.state.value),
                     "trigger": "LIFEBOAT_REBUY",
                     "details": {"rebuy_qty": int(q), "rebuy_price": float(px), "new_avg_cost": float(ps.avg_cost)},
@@ -462,6 +678,7 @@ class PositionFSM:
             ps.total_qty = int(new_qty)
             ps.avg_cost = float(new_avg)
             ps.last_scale_date = now.strftime("%Y-%m-%d")
+            ps.same_day_buy_qty = int(ps.same_day_buy_qty) + int(fill_qty)
             trigger = f"SCALE_{int(eval_result.scale_number)}_FILLED" if should_transition else f"SCALE_{int(eval_result.scale_number)}_PARTIAL_FILL"
             log_fsm_transition(
                 log_path=self._log_path,
@@ -553,7 +770,14 @@ class PositionFSM:
         )
         try:
             _ = self._t0_engine.load_daily_kde(etf_code=str(etf_code), trade_date=trade_date.date())
-        except Exception:
+        except Exception as e:
+            degrade_once(
+                f"t0_kde_load_failed:{str(etf_code)}",
+                (
+                    "T0 KDE zones load failed; T0 signal will run without KDE support merge. "
+                    f"etf={etf_code} trade_date={trade_date.date().isoformat()} err={repr(e)}"
+                ),
+            )
             return None
 
     def _t0_open_trade(self, *, ps: PositionState) -> Optional[T0TradeRecord]:
@@ -709,7 +933,11 @@ class PositionFSM:
             lock_amount = float(req.price) * float(req.quantity)
             try:
                 cm.lock_cash(order_id=int(order_id), etf_code=code, side="BUY", amount=float(lock_amount), priority=4, strategy_name="t0")
-            except AssertionError:
+            except AssertionError as e:
+                degrade_once(
+                    f"t0_lock_cash_failed:{str(code)}",
+                    f"T0 BUY lock cash failed; order canceled and T0 frozen. etf={code} order_id={int(order_id)} err={str(e)}",
+                )
                 _ = self._trading.cancel_order(int(order_id))
                 self._trading.enter_freeze_mode("T0_LOCK_CASH_FAILED")
                 with self._mutex:

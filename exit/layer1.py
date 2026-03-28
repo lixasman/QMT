@@ -13,9 +13,10 @@ from .constants import (
     DEADWATER_MIN_DAYS_HELD,
     GAP_CHECK_TIMES,
     GAP_STOP_MULTIPLIER,
-    LAYER1_SELL_DISCOUNT,
+    STOP_BREAK_BUFFER_TICKS,
     T0_DAILY_LOSS_CIRCUIT_BREAKER_PCT,
 )
+from .exit_config import get_exit_layer1_sell_discount, get_exit_layer1_use_stop_price
 from .lifeboat import plan_lifeboat_sell
 from .types import LayerDecision
 
@@ -26,9 +27,21 @@ class Layer1Trigger:
     reason: str
 
 
-def _layer1_sell_price(*, instrument: InstrumentInfo, bid1: float) -> float:
+def _layer1_sell_price(
+    *,
+    instrument: InstrumentInfo,
+    bid1: float,
+    stop_price: float | None = None,
+    sell_discount: float | None = None,
+    use_stop_price: bool | None = None,
+) -> float:
+    discount = float(get_exit_layer1_sell_discount()) if sell_discount is None else float(sell_discount)
+    prefer_stop = bool(get_exit_layer1_use_stop_price()) if use_stop_price is None else bool(use_stop_price)
+    raw_price = float(bid1) * float(discount)
+    if bool(prefer_stop) and stop_price is not None and float(stop_price) > 0.0:
+        raw_price = float(stop_price)
     return align_order_price(
-        price=float(bid1) * float(LAYER1_SELL_DISCOUNT),
+        price=float(raw_price),
         side=OrderSide.SELL.value,
         lower_limit=float(instrument.limit_down),
         upper_limit=float(instrument.limit_up),
@@ -45,7 +58,10 @@ def decide_full_exit(
     sellable_qty: int,
     total_qty: int,
     locked_qty: int,
+    stop_price: float | None = None,
     extra: Optional[dict[str, Any]] = None,
+    sell_discount: float | None = None,
+    use_stop_price: bool | None = None,
 ) -> LayerDecision:
     sq = int(sellable_qty)
     tq = int(total_qty)
@@ -54,7 +70,13 @@ def decide_full_exit(
         raise AssertionError(f"invalid qty: total={tq} sellable={sq} locked={lq}")
     if sq > tq and tq > 0:
         raise AssertionError(f"sellable_qty > total_qty: {sq} > {tq}")
-    sell_price = _layer1_sell_price(instrument=instrument, bid1=float(snapshot.bid1_price))
+    sell_price = _layer1_sell_price(
+        instrument=instrument,
+        bid1=float(snapshot.bid1_price),
+        stop_price=stop_price,
+        sell_discount=sell_discount,
+        use_stop_price=use_stop_price,
+    )
     order = None
     if int(sq) > 0:
         order = OrderRequest(
@@ -72,7 +94,9 @@ def decide_full_exit(
 
 
 def check_gap_protection(*, now_time: time, last_price: float, stop_price: float) -> Layer1Trigger:
-    if now_time not in GAP_CHECK_TIMES:
+    # Compare at minute granularity so 09:25:xx / 13:00:xx still count.
+    key = time(int(now_time.hour), int(now_time.minute))
+    if key not in GAP_CHECK_TIMES:
         return Layer1Trigger(triggered=False, reason="NOT_GAP_CHECK_TIME")
     if float(last_price) < float(stop_price) * float(GAP_STOP_MULTIPLIER):
         return Layer1Trigger(triggered=True, reason="GAP_PROTECTION")
@@ -92,8 +116,10 @@ def should_freeze_t0(*, t0_realized_loss_pct: float) -> bool:
     return bool(float(loss) >= float(T0_DAILY_LOSS_CIRCUIT_BREAKER_PCT))
 
 
-def check_stop_break(*, last_price: float, stop_price: float) -> Layer1Trigger:
-    if float(last_price) < float(stop_price):
+def check_stop_break(*, last_price: float, stop_price: float, price_tick: float) -> Layer1Trigger:
+    tick = max(0.0, float(price_tick))
+    threshold = float(stop_price) - float(STOP_BREAK_BUFFER_TICKS) * float(tick)
+    if float(last_price) < float(threshold):
         return Layer1Trigger(triggered=True, reason="STOP_BREAK")
     return Layer1Trigger(triggered=False, reason="STOP_OK")
 
@@ -110,6 +136,8 @@ def decide_layer1_on_trigger(
     total_qty: int,
     sellable_qty: int,
     now: datetime,
+    sell_discount: float | None = None,
+    use_stop_price: bool | None = None,
 ) -> LayerDecision:
     if not (float(snapshot.last_price) < float(stop_price)):
         raise AssertionError("Layer 1 触发但价格未破 Stop，逻辑错误")
@@ -134,7 +162,10 @@ def decide_layer1_on_trigger(
             sellable_qty=int(sq),
             total_qty=int(tq),
             locked_qty=int(locked_qty),
+            stop_price=float(stop_price),
             extra={},
+            sell_discount=sell_discount,
+            use_stop_price=use_stop_price,
         )
 
     if float(score_soft) > 0.0:
@@ -146,14 +177,25 @@ def decide_layer1_on_trigger(
             sellable_qty=int(sq),
             total_qty=int(tq),
             locked_qty=int(locked_qty),
+            stop_price=float(stop_price),
             extra={"score_soft": float(score_soft)},
+            sell_discount=sell_discount,
+            use_stop_price=use_stop_price,
         )
 
     if float(score_soft) != 0.0:
         raise AssertionError(f"Score_soft must be discrete, got: {score_soft}")
 
     if not bool(lifeboat_used):
-        plan = plan_lifeboat_sell(instrument=instrument, snapshot=snapshot, sellable_qty=int(sq), now=now)
+        plan = plan_lifeboat_sell(
+            instrument=instrument,
+            snapshot=snapshot,
+            sellable_qty=int(sq),
+            now=now,
+            stop_price=float(stop_price),
+            sell_discount=sell_discount,
+            use_stop_price=use_stop_price,
+        )
         if int(plan.sell_qty) > int(sq):
             raise AssertionError(f"卖出 {plan.sell_qty} 超过可用余额 {sq}")
         order = None
@@ -188,5 +230,8 @@ def decide_layer1_on_trigger(
         sellable_qty=int(sq),
         total_qty=int(tq),
         locked_qty=int(locked_qty),
+        stop_price=float(stop_price),
         extra={},
+        sell_discount=sell_discount,
+        use_stop_price=use_stop_price,
     )

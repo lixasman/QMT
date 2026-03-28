@@ -31,3 +31,28 @@ def test_load_watchlist_items_normalizes_etf_code(tmp_path: Path) -> None:
 
     assert "512480.SH" in res.ext_factors
     assert "512480" in res.ext_factors
+
+
+def test_load_watchlist_items_can_skip_sentiment_loading(tmp_path: Path) -> None:
+    chip_dir = tmp_path / "chip"
+    fin_dir = tmp_path / "finintel"
+    chip_dir.mkdir(parents=True, exist_ok=True)
+    fin_dir.mkdir(parents=True, exist_ok=True)
+
+    (chip_dir / "batch_results_20260209.csv").write_text(
+        "code,trade_date,profit_ratio,dpc_peak_density,chip_engine_days\n"
+        "512480,20260209,82.3,0.12,15\n",
+        encoding="utf-8",
+    )
+
+    now = datetime.fromisoformat("2026-02-10T10:00:00")
+    res = load_watchlist_items(
+        etf_codes=["512480"],
+        now=now,
+        integration_dir=tmp_path,
+        load_sentiment=False,
+    )
+
+    assert len(res.items) == 1
+    assert res.items[0].sentiment_score == 50
+    assert abs(float(res.ext_factors["512480.SH"]["sentiment_score_01"]) - 0.5) < 1e-9

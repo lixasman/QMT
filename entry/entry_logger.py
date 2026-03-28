@@ -7,6 +7,8 @@ from typing import Any
 
 
 def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    if str(path).strip() in ("", "."):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, ensure_ascii=False)
     with path.open("a", encoding="utf-8") as f:
@@ -76,4 +78,3 @@ def log_phase3_rejected(
         "details": details,
     }
     _append_jsonl(p, payload)
-

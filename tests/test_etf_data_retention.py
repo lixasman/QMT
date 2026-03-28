@@ -52,6 +52,19 @@ def test_apply_data_retention_prunes_project_files(tmp_path: Path, monkeypatch) 
     assert (tmp_path / "output" / "cache" / "chip_tick_download" / f"tick_{keep_day}.json").exists()
 
 
+def test_apply_data_retention_default_keep_days_is_0(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        daily_batch,
+        "cleanup_xtdata_dated_files",
+        lambda keep_days=365, today=None: {"enabled": True, "keep_days": keep_days, "removed_files": 0, "removed_bytes": 0},
+    )
+
+    stats = daily_batch._apply_data_retention(today=date(2026, 2, 25), base_dir=tmp_path)
+
+    assert stats["keep_days"] == 0
+    assert stats["enabled"] is False
+
+
 def test_cleanup_xtdata_dated_files_prunes_old_dat(tmp_path: Path, monkeypatch) -> None:
     data_dir = tmp_path / "datadir"
     old_file = data_dir / "SH" / "0" / "510300" / "20240220.dat"
@@ -67,4 +80,3 @@ def test_cleanup_xtdata_dated_files_prunes_old_dat(tmp_path: Path, monkeypatch) 
     assert stats["removed_files"] == 1
     assert not old_file.exists()
     assert keep_file.exists()
-

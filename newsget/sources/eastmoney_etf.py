@@ -16,13 +16,21 @@ class EtfHolding:
     stock_name: str
 
 
+def _normalize_etf_code6(code: str) -> str:
+    s = str(code or "").strip().upper()
+    if "." in s:
+        s = s.split(".", 1)[0]
+    m = re.search(r"(\d{6})", s)
+    return m.group(1) if m else s
+
+
 def fetch_etf_top10_holdings(
     session: requests.Session,
     etf_code: str,
     *,
     topline: int = 10,
 ) -> tuple[str, Optional[str], List[EtfHolding]]:
-    etf_code = etf_code.strip()
+    etf_code = _normalize_etf_code6(etf_code)
     url = (
         "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
         f"?type=jjcc&code={etf_code}&topline={topline}&year=&month=&rt=0.1"

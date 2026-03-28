@@ -26,6 +26,14 @@ def test_models_roundtrip() -> None:
         locked_orders=[
             LockedOrder(order_id=1, etf_code="159915", side="BUY", amount=14000.0, priority=1, strategy_name="T0", lock_time="2026-02-22T09:30:00"),
         ],
+        exit_order_intents={
+            "101": {
+                "action": "FULL_EXIT",
+                "etf_code": "159915",
+                "locked_qty": 7000,
+                "expected_remaining_qty": 7000,
+            }
+        },
     )
     pos = PositionState(
         etf_code="159915",
@@ -64,4 +72,3 @@ def test_models_roundtrip() -> None:
     d = ps.to_dict()
     ps2 = PortfolioState.from_dict(d)
     assert ps2.to_dict() == d
-

@@ -209,7 +209,13 @@ def _fetch_latest_news_for_holding(
         if max_age_days > 0 and latest_ak is None:
             try:
                 any_ak = fetch_stock_latest_news_from_akshare(stock_code=holding.stock_code, max_age_days=0)
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "ETF Phase1: AKShare 过期探测失败，已降级按无新闻处理 code=%s name=%s err=%s",
+                    holding.stock_code,
+                    holding.stock_name,
+                    repr(e),
+                )
                 any_ak = None
             if any_ak is not None:
                 meta.update({"used_source": "akshare", "status": "dropped", "reason": "too_old", "error": ""})
@@ -240,7 +246,13 @@ def _fetch_latest_news_for_holding(
                 any_hit = fetch_cls_latest_news_by_keyword(
                     session, keyword=f"{holding.stock_name} {holding.stock_code}", max_age_days=0
                 )
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    "ETF Phase1: CLS 过期探测失败，已降级按无命中处理 code=%s name=%s err=%s",
+                    holding.stock_code,
+                    holding.stock_name,
+                    repr(e),
+                )
                 any_hit = None
             if any_hit is not None:
                 meta.update({"used_source": "cls", "status": "dropped", "reason": "too_old", "error": ""})
@@ -267,7 +279,13 @@ def _fetch_latest_news_for_holding(
                             stock_name=holding.stock_name,
                             max_age_days=0,
                         )
-                    except Exception:
+                    except Exception as e:
+                        logger.warning(
+                            "ETF Phase1: 东财过期探测失败，已降级按无新闻处理 code=%s name=%s err=%s",
+                            holding.stock_code,
+                            holding.stock_name,
+                            repr(e),
+                        )
                         any_latest = None
                     if any_latest is not None:
                         meta.update({"used_source": "eastmoney", "status": "dropped", "reason": "too_old", "error": ""})

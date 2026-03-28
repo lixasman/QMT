@@ -45,23 +45,33 @@ def _normalize_code_key(code: str) -> str:
 
 
 def _read_history(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
     if path.suffix.lower() == ".parquet":
-        try:
-            return pd.read_parquet(path)
-        except Exception:
-            csv_path = path.with_suffix(".csv")
-            if csv_path.exists():
-                try:
-                    return pd.read_csv(csv_path, dtype={"trade_date": str})
-                except Exception:
-                    return pd.DataFrame()
-            return pd.DataFrame()
-    try:
-        return pd.read_csv(path, dtype={"trade_date": str})
-    except Exception:
+        csv_path = path.with_suffix(".csv")
+        if path.exists():
+            try:
+                return pd.read_parquet(path)
+            except Exception:
+                pass
+        if csv_path.exists():
+            try:
+                return pd.read_csv(csv_path, dtype={"trade_date": str})
+            except Exception:
+                return pd.DataFrame()
         return pd.DataFrame()
+
+    if path.exists():
+        try:
+            return pd.read_csv(path, dtype={"trade_date": str})
+        except Exception:
+            pass
+
+    parquet_path = path.with_suffix(".parquet")
+    if parquet_path.exists():
+        try:
+            return pd.read_parquet(parquet_path)
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 
 def _write_history(df: pd.DataFrame, path: Path) -> None:
@@ -213,6 +223,7 @@ class MicrostructureEngine:
         snapshots: pd.DataFrame,
         premium_rates: Optional[pd.Series] = None,
         adv_60: Optional[float] = None,
+        tick_size: float | None = None,
     ) -> dict[str, object]:
         """Execute the full M0→M8 pipeline for one ETF on one day.
 
@@ -242,7 +253,7 @@ class MicrostructureEngine:
         microprice = compute_microprice(clean)
 
         # ── Step 2: M2 BVC ────────────────────────────────────────────
-        bvc_result = self.bvc.classify(clean, microprice)
+        bvc_result = self.bvc.classify(clean, microprice, tick_size=tick_size)
         # Write v_buy/v_sell into clean for VPIN bucket builder
         clean = clean.copy()
         clean["v_buy"] = bvc_result.v_buy
@@ -267,6 +278,7 @@ class MicrostructureEngine:
             microprice=microprice,
             limit_locked_mask=limit_mask,
             valid_mask=valid_cont_mask,
+            tick_size=tick_size,
         )
 
         # ── Step 5: M5 Kyle's Lambda ─────────────────────────────────

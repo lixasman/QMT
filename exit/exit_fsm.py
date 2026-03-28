@@ -4,19 +4,27 @@ import threading
 from datetime import datetime, time
 from typing import Any, Optional
 
-from core.enums import ActionType, DataQuality, FSMState, OrderSide, OrderType
+from core.buy_order_config import get_aggressive_buy_multiplier, get_aggressive_buy_use_ask1
+from core.enums import ActionType, DataQuality, FSMState, OrderSide, OrderStatus, OrderType
 from core.interfaces import DataAdapter, OrderRequest, TradingAdapter
 from core.models import PendingSell, PortfolioState, PositionState
 from core.state_manager import StateManager
-from core.warn_utils import warn_once
+from core.warn_utils import degrade_once, warn_once
 from core.validators import assert_action_allowed
 
 from .exit_logger import (
     log_layer1_triggered,
     log_layer2_reduce,
+    log_layer2_score,
     log_lifeboat_buyback,
     log_lifeboat_buyback_rejected,
     serialize_data_health,
+)
+from .exit_config import (
+    get_exit_layer1_sell_discount,
+    get_exit_layer1_use_stop_price,
+    get_exit_layer2_score_log,
+    get_exit_layer2_threshold,
 )
 from .layer1 import (
     _layer1_sell_price,
@@ -143,6 +151,28 @@ def _extract_sellable_qty(p: Any) -> int:
     return 0
 
 
+def _extract_avg_cost(p: Any) -> float:
+    if isinstance(p, dict):
+        for k in ("avg_cost", "avg_price", "cost_price", "open_price", "参考成本价", "成本价"):
+            v = p.get(k)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return 0.0
+    for k2 in ("avg_cost", "avg_price", "cost_price", "open_price"):
+        v2 = getattr(p, k2, None)
+        if v2 is None:
+            continue
+        try:
+            return float(v2)
+        except Exception:
+            continue
+    return 0.0
+
+
 class ExitFSM:
     def __init__(
         self,
@@ -153,6 +183,13 @@ class ExitFSM:
         state: PortfolioState,
         log_path: str = "data/logs/exit_decisions.jsonl",
         mutex: threading.Lock = EXIT_MUTEX,
+        layer1_sell_discount: float | None = None,
+        layer1_use_stop_price: bool | None = None,
+        layer2_threshold: float | None = None,
+        layer2_score_log: bool | None = None,
+        aggressive_buy_multiplier: float | None = None,
+        aggressive_buy_use_ask1: bool | None = None,
+        enable_t0: bool = False,
     ) -> None:
         self._sm = state_manager
         self._data = data
@@ -160,6 +197,13 @@ class ExitFSM:
         self._state = state
         self._mutex = mutex
         self._log_path = str(log_path)
+        self._layer1_sell_discount = float(get_exit_layer1_sell_discount()) if layer1_sell_discount is None else float(layer1_sell_discount)
+        self._layer1_use_stop_price = bool(get_exit_layer1_use_stop_price()) if layer1_use_stop_price is None else bool(layer1_use_stop_price)
+        self._layer2_threshold = float(get_exit_layer2_threshold()) if layer2_threshold is None else float(layer2_threshold)
+        self._layer2_score_log = bool(get_exit_layer2_score_log()) if layer2_score_log is None else bool(layer2_score_log)
+        self._aggressive_buy_multiplier = float(get_aggressive_buy_multiplier()) if aggressive_buy_multiplier is None else float(aggressive_buy_multiplier)
+        self._aggressive_buy_use_ask1 = bool(get_aggressive_buy_use_ask1()) if aggressive_buy_use_ask1 is None else bool(aggressive_buy_use_ask1)
+        self._enable_t0 = bool(enable_t0)
 
     @property
     def state(self) -> PortfolioState:
@@ -167,6 +211,35 @@ class ExitFSM:
 
     def save(self) -> None:
         self._sm.save(self._state)
+
+    def remember_order_intent(
+        self,
+        *,
+        order_id: int,
+        action: str,
+        etf_code: str,
+        locked_qty: int = 0,
+        expected_remaining_qty: int = 0,
+    ) -> None:
+        oid = int(order_id)
+        if oid <= 0:
+            return
+        self._state.exit_order_intents[str(int(oid))] = {
+            "action": str(action),
+            "etf_code": str(etf_code),
+            "locked_qty": int(locked_qty),
+            "expected_remaining_qty": int(expected_remaining_qty),
+        }
+        self.save()
+
+    def pop_order_intent(self, *, order_id: int) -> Optional[dict[str, Any]]:
+        oid = int(order_id)
+        if oid <= 0:
+            return None
+        raw = self._state.exit_order_intents.pop(str(int(oid)), None)
+        if raw is None:
+            return None
+        return dict(raw)
 
     def upsert_position(self, *, etf_code: str) -> PositionState:
         code = str(etf_code)
@@ -180,18 +253,64 @@ class ExitFSM:
         code = str(etf_code)
         raw = self._trading.query_positions()
         total = 0
-        sellable = 0
+        broker_sellable = 0
         for p in raw:
             c = _extract_etf_code(p)
             if str(c) != code:
                 continue
             total = int(_extract_total_qty(p))
-            sellable = int(_extract_sellable_qty(p))
+            broker_sellable = int(_extract_sellable_qty(p))
             break
+        sellable = int(min(int(total), int(broker_sellable)))
+        if not self._enable_t0:
+            ps = self._state.positions.get(code)
+            same_day_buy_qty = 0
+            if ps is not None:
+                same_day_buy_qty = max(0, int(getattr(ps, "same_day_buy_qty", 0) or 0))
+                same_day_buy_qty = min(int(total), int(same_day_buy_qty))
+            sellable = min(int(sellable), max(0, int(total) - int(same_day_buy_qty)))
         locked = int(total) - int(sellable)
         if locked < 0:
             locked = 0
         return int(total), int(sellable), int(locked)
+
+    def _reset_position_to_idle(self, *, ps: PositionState) -> None:
+        ps.state = FSMState.S0_IDLE
+        ps.base_qty = 0
+        ps.scale_1_qty = 0
+        ps.scale_2_qty = 0
+        ps.total_qty = 0
+        ps.avg_cost = 0.0
+        ps.effective_slot = 0.0
+        ps.scale_count = 0
+        ps.last_scale_date = ""
+        ps.t0_frozen = False
+        ps.t0_max_exposure = 0.0
+        ps.highest_high = 0.0
+        ps.entry_date = ""
+        ps.pending_sell_locked = []
+        ps.pending_sell_unfilled = []
+        ps.t0_trades = []
+        ps.cooldown_until = ""
+        ps.lifeboat_used = False
+        ps.lifeboat_sell_time = ""
+        ps.lifeboat_tight_stop = 0.0
+        ps.last_lifeboat_buyback_date = ""
+        ps.auction_volume_history = []
+        ps.same_day_buy_qty = 0
+
+    def _sync_reduced_position_after_sell(self, *, ps: PositionState, remaining_qty: int) -> None:
+        remain = max(0, int(remaining_qty))
+        if remain <= 0:
+            self._reset_position_to_idle(ps=ps)
+            return
+        ps.state = FSMState.S5_REDUCED
+        ps.total_qty = int(remain)
+        ps.base_qty = int(remain)
+        ps.scale_1_qty = 0
+        ps.scale_2_qty = 0
+        ps.t0_frozen = True
+        ps.t0_max_exposure = 0.0
 
     def recover_on_startup(self) -> None:
         with self._mutex:
@@ -205,6 +324,14 @@ class ExitFSM:
         q = int(locked_qty)
         if q <= 0:
             return
+        # Keep a single consolidated T1 lock record so repeated intraday checks
+        # do not duplicate next-day forced sells for the same residual position.
+        others = [p for p in list(ps.pending_sell_locked) if int(p.locked_qty) > 0 and str(p.lock_reason) != "T1_LOCKED"]
+        existing_t1 = [p for p in list(ps.pending_sell_locked) if int(p.locked_qty) > 0 and str(p.lock_reason) == "T1_LOCKED"]
+        if len(existing_t1) == 1 and int(existing_t1[0].locked_qty) == int(q) and len(others) + 1 == len(
+            [p for p in list(ps.pending_sell_locked) if int(p.locked_qty) > 0]
+        ):
+            return
         item = PendingSell(
             etf_code=str(ps.etf_code),
             locked_qty=int(q),
@@ -213,7 +340,7 @@ class ExitFSM:
             sell_price_type="LAYER1",
             created_time=now.isoformat(timespec="seconds"),
         )
-        ps.pending_sell_locked.append(item)
+        ps.pending_sell_locked = list(others) + [item]
 
     def execute_pending_locked(self, *, now: datetime) -> int:
         t = now.time()
@@ -241,7 +368,7 @@ class ExitFSM:
                 except Exception:
                     continue
 
-                sell_price = _layer1_sell_price(instrument=inst, bid1=float(snap.bid1_price))
+                sell_price = _layer1_sell_price(instrument=inst, bid1=float(snap.bid1_price), sell_discount=self._layer1_sell_discount, use_stop_price=self._layer1_use_stop_price)
                 req = OrderRequest(
                     etf_code=str(code),
                     side=OrderSide.SELL,
@@ -255,13 +382,18 @@ class ExitFSM:
                 if int(res.order_id) <= 0:
                     self._trading.enter_freeze_mode(res.error or "PENDING_PLACE_ORDER_FAILED")
                     continue
-                _ = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+                final = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+                if final.status != OrderStatus.FILLED:
+                    continue
                 executed += 1
                 remaining = int(pending_qty) - int(sell_qty)
                 ps.pending_sell_locked = []
                 if remaining > 0:
                     self._append_pending_sell_locked(ps=ps, locked_qty=int(remaining), now=now)
-                ps.total_qty = int(total)
+                self._sync_reduced_position_after_sell(
+                    ps=ps,
+                    remaining_qty=max(0, int(total) - int(sell_qty)),
+                )
             self.save()
         return int(executed)
 
@@ -283,14 +415,30 @@ class ExitFSM:
                 return None
             snap = self._data.get_snapshot(etf_code)
             inst = self._data.get_instrument_info(etf_code)
-            dec = decide_layer2(etf_code=etf_code, instrument=inst, snapshot=snap, score_soft=float(score_soft), sellable_qty=int(sellable))
+            if self._layer2_score_log:
+                log_layer2_score(
+                    log_path=self._log_path,
+                    timestamp=now,
+                    etf_code=etf_code,
+                    score_soft=float(score_soft),
+                    signals={} if signals is None else dict(signals),
+                )
+            dec = decide_layer2(etf_code=etf_code, instrument=inst, snapshot=snap, score_soft=float(score_soft), sellable_qty=int(sellable), threshold=self._layer2_threshold)
             if dec.action != "REDUCE_50" or dec.order is None:
                 return None
             res = self._trading.place_order(dec.order)
             if int(res.order_id) <= 0:
                 self._trading.enter_freeze_mode(res.error or "LAYER2_PLACE_ORDER_FAILED")
                 return None
-            _ = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+            self.remember_order_intent(
+                order_id=int(res.order_id),
+                action="LAYER2_REDUCE",
+                etf_code=str(etf_code),
+                expected_remaining_qty=max(0, int(total) - int(dec.order.quantity)),
+            )
+            final = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+            if final.status != OrderStatus.FILLED:
+                return int(res.order_id)
             log_layer2_reduce(
                 log_path=self._log_path,
                 timestamp=now,
@@ -304,6 +452,103 @@ class ExitFSM:
             ps.t0_frozen = True
             self.save()
             return int(res.order_id)
+
+    def apply_gap_check_only(
+        self,
+        *,
+        now: datetime,
+        etf_code: str,
+        stop_price: float,
+        chandelier_k: Optional[float] = None,
+        chandelier_hh: Optional[float] = None,
+        chandelier_atr: Optional[float] = None,
+    ) -> Optional[int]:
+        with self._mutex:
+            ps = self.upsert_position(etf_code=etf_code)
+            total, sellable, locked = self.query_balances(etf_code=etf_code)
+            ps.total_qty = int(total)
+            snap = self._data.get_snapshot(etf_code)
+            inst = self._data.get_instrument_info(etf_code)
+
+            if snap.data_quality != DataQuality.OK:
+                degrade_once(
+                    f"exit_gap_only_blocked_by_data_quality:{str(etf_code)}:{str(snap.data_quality.value)}",
+                    f"Gap-only check skipped by data quality gate. etf={etf_code} data_quality={snap.data_quality.value}",
+                )
+                return None
+
+            gap = check_gap_protection(now_time=now.time(), last_price=float(snap.last_price), stop_price=float(stop_price))
+            if not gap.triggered:
+                self.save()
+                return None
+
+            dec = decide_full_exit(
+                etf_code=etf_code,
+                instrument=inst,
+                snapshot=snap,
+                reason="GAP_PROTECTION",
+                sellable_qty=int(sellable),
+                total_qty=int(total),
+                locked_qty=int(locked),
+                extra={"stop_price": float(stop_price), "last_price": float(snap.last_price), "now_time": now.strftime("%H:%M")},
+                sell_discount=self._layer1_sell_discount,
+                use_stop_price=self._layer1_use_stop_price,
+            )
+
+            if dec.order is not None:
+                res = self._trading.place_order(dec.order)
+                if int(res.order_id) <= 0:
+                    self._trading.enter_freeze_mode(res.error or "GAP_ONLY_PLACE_ORDER_FAILED")
+                    return None
+                self.remember_order_intent(
+                    order_id=int(res.order_id),
+                    action="FULL_EXIT",
+                    etf_code=str(etf_code),
+                    locked_qty=int(dec.extra.get("locked_qty") or 0),
+                    expected_remaining_qty=int(dec.extra.get("locked_qty") or 0),
+                )
+                final = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+                if final.status != OrderStatus.FILLED:
+                    return int(res.order_id)
+                oid = int(res.order_id)
+            else:
+                oid = 0
+
+            if dec.action == "FULL_EXIT":
+                locked_qty = int(dec.extra.get("locked_qty") or 0)
+                if locked_qty > 0:
+                    self._append_pending_sell_locked(ps=ps, locked_qty=int(locked_qty), now=now)
+                if locked_qty > 0:
+                    ps.t0_frozen = True
+
+            trigger: dict[str, Any] = {
+                "last_price": float(snap.last_price),
+                "stop_price": float(stop_price),
+            }
+            if chandelier_k is not None:
+                trigger["k_value"] = float(chandelier_k)
+            if chandelier_hh is not None:
+                trigger["HH"] = float(chandelier_hh)
+            if chandelier_atr is not None:
+                trigger["ATR"] = float(chandelier_atr)
+
+            context = {
+                "score_soft": 0.0,
+                "data_health": serialize_data_health({"L1": snap.data_quality}),
+                "lifeboat_used": bool(ps.lifeboat_used),
+                "trigger_mode": "GAP_ONLY",
+            }
+            log_layer1_triggered(
+                log_path=self._log_path,
+                timestamp=now,
+                etf_code=etf_code,
+                trigger=trigger,
+                context=context,
+                decision=str(dec.action),
+                order=_order_dict(dec.order),
+            )
+            self.save()
+            return int(oid) if oid > 0 else None
 
     def apply_layer1_checks(
         self,
@@ -331,11 +576,24 @@ class ExitFSM:
                 ps.t0_frozen = True
 
             if snap.data_quality != DataQuality.OK:
+                degrade_once(
+                    f"exit_layer1_blocked_by_data_quality:{str(etf_code)}:{str(snap.data_quality.value)}",
+                    f"Layer1 check skipped by data quality gate. etf={etf_code} data_quality={snap.data_quality.value}",
+                )
                 return None
 
             gap = check_gap_protection(now_time=now.time(), last_price=float(snap.last_price), stop_price=float(stop_price))
             dead = check_deadwater(days_held=int(days_held), current_return=float(current_return))
-            stopb = check_stop_break(last_price=float(snap.last_price), stop_price=float(stop_price))
+            # Lifeboat behavior:
+            # - First STOP_BREAK with score_soft==0 triggers LIFEBOAT_70_30 (sell 70%, retain 30%) and records sell_time + tight_stop.
+            # - Afterwards, do NOT keep selling 70% repeatedly while price hovers around stop. Only clear the remaining 30% if tight_stop breaks.
+            lifeboat_active = bool(ps.lifeboat_sell_time) and (not bool(ps.lifeboat_used)) and float(getattr(ps, "lifeboat_tight_stop", 0.0) or 0.0) > 0.0
+            eff_stop = float(getattr(ps, "lifeboat_tight_stop", 0.0) or 0.0) if lifeboat_active else float(stop_price)
+            stopb = check_stop_break(
+                last_price=float(snap.last_price),
+                stop_price=float(eff_stop),
+                price_tick=float(inst.price_tick),
+            )
 
             if not (gap.triggered or dead.triggered or stopb.triggered):
                 self.save()
@@ -351,6 +609,8 @@ class ExitFSM:
                     total_qty=int(total),
                     locked_qty=int(locked),
                     extra={"days_held": int(days_held), "return": float(current_return)},
+                    sell_discount=self._layer1_sell_discount,
+                    use_stop_price=self._layer1_use_stop_price,
                 )
             elif gap.triggered:
                 dec = decide_full_exit(
@@ -361,7 +621,28 @@ class ExitFSM:
                     sellable_qty=int(sellable),
                     total_qty=int(total),
                     locked_qty=int(locked),
+                    stop_price=float(stop_price),
                     extra={"stop_price": float(stop_price), "last_price": float(snap.last_price), "now_time": now.strftime("%H:%M")},
+                    sell_discount=self._layer1_sell_discount,
+                    use_stop_price=self._layer1_use_stop_price,
+                )
+            elif lifeboat_active:
+                dec = decide_full_exit(
+                    etf_code=etf_code,
+                    instrument=inst,
+                    snapshot=snap,
+                    reason="LIFEBOAT_TIGHT_STOP",
+                    sellable_qty=int(sellable),
+                    total_qty=int(total),
+                    locked_qty=int(locked),
+                    stop_price=float(eff_stop),
+                    extra={
+                        "tight_stop": float(getattr(ps, "lifeboat_tight_stop", 0.0) or 0.0),
+                        "stop_price": float(stop_price),
+                        "last_price": float(snap.last_price),
+                    },
+                    sell_discount=self._layer1_sell_discount,
+                    use_stop_price=self._layer1_use_stop_price,
                 )
             else:
                 dec = decide_layer1_on_trigger(
@@ -371,32 +652,46 @@ class ExitFSM:
                     stop_price=float(stop_price),
                     score_soft=float(score_soft),
                     data_health=data_health,
-                    lifeboat_used=bool(ps.lifeboat_used),
+                    lifeboat_used=bool(ps.lifeboat_sell_time),
                     total_qty=int(total),
                     sellable_qty=int(sellable),
                     now=now,
+                    sell_discount=self._layer1_sell_discount,
+                    use_stop_price=self._layer1_use_stop_price,
                 )
-
-            if dec.action == "LIFEBOAT_70_30":
-                ps.lifeboat_sell_time = str(dec.extra.get("sell_time") or "")
-                if not ps.lifeboat_sell_time:
-                    raise AssertionError("lifeboat sell_time missing")
 
             if dec.order is not None:
                 res = self._trading.place_order(dec.order)
                 if int(res.order_id) <= 0:
                     self._trading.enter_freeze_mode(res.error or "LAYER1_PLACE_ORDER_FAILED")
                     return None
-                _ = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+                if dec.action == "FULL_EXIT":
+                    self.remember_order_intent(
+                        order_id=int(res.order_id),
+                        action="FULL_EXIT",
+                        etf_code=str(etf_code),
+                        locked_qty=int(dec.extra.get("locked_qty") or 0),
+                        expected_remaining_qty=int(dec.extra.get("locked_qty") or 0),
+                    )
+                final = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+                if final.status != OrderStatus.FILLED:
+                    return int(res.order_id)
                 oid = int(res.order_id)
             else:
                 oid = 0
+
+            if dec.action == "LIFEBOAT_70_30":
+                ps.lifeboat_sell_time = str(dec.extra.get("sell_time") or "")
+                ps.lifeboat_tight_stop = float(dec.extra.get("tight_stop") or 0.0)
+                if not ps.lifeboat_sell_time:
+                    raise AssertionError("lifeboat sell_time missing")
 
             if dec.action == "FULL_EXIT":
                 locked_qty = int(dec.extra.get("locked_qty") or 0)
                 if locked_qty > 0:
                     self._append_pending_sell_locked(ps=ps, locked_qty=int(locked_qty), now=now)
-                ps.state = FSMState.S0_IDLE
+                if locked_qty > 0:
+                    ps.t0_frozen = True
             trigger: dict[str, Any] = {
                 "last_price": float(snap.last_price),
                 "stop_price": float(stop_price),
@@ -440,11 +735,27 @@ class ExitFSM:
             ps = self.upsert_position(etf_code=etf_code)
             if ps.lifeboat_used:
                 return None
+            if str(getattr(ps, "last_lifeboat_buyback_date", "") or "") == now.strftime("%Y-%m-%d"):
+                log_lifeboat_buyback_rejected(
+                    log_path=self._log_path,
+                    timestamp=now,
+                    etf_code=etf_code,
+                    reason="ALREADY_BOUGHT_BACK_TODAY",
+                    details={
+                        "last_lifeboat_buyback_date": str(getattr(ps, "last_lifeboat_buyback_date", "") or ""),
+                        "current_date": now.strftime("%Y-%m-%d"),
+                    },
+                )
+                return None
             if not ps.lifeboat_sell_time:
                 return None
             try:
                 sell_time = datetime.fromisoformat(str(ps.lifeboat_sell_time))
-            except Exception:
+            except Exception as e:
+                degrade_once(
+                    f"lifeboat_sell_time_invalid:{str(etf_code)}",
+                    f"lifeboat buyback skipped due to invalid sell_time format. etf={etf_code} raw={ps.lifeboat_sell_time} err={repr(e)}",
+                )
                 return None
 
             total, sellable, locked = self.query_balances(etf_code=etf_code)
@@ -452,6 +763,10 @@ class ExitFSM:
             snap = self._data.get_snapshot(etf_code)
             inst = self._data.get_instrument_info(etf_code)
             if snap.data_quality != DataQuality.OK:
+                degrade_once(
+                    f"lifeboat_buyback_blocked_by_data_quality:{str(etf_code)}:{str(snap.data_quality.value)}",
+                    f"lifeboat buyback skipped by data quality gate. etf={etf_code} data_quality={snap.data_quality.value}",
+                )
                 return None
 
             ev = evaluate_buyback(
@@ -482,6 +797,8 @@ class ExitFSM:
                     current_total_qty=int(total),
                     trading_minutes_elapsed=int(ev.trading_minutes_elapsed),
                     now=now,
+                    buy_multiplier=self._aggressive_buy_multiplier,
+                    use_ask1=self._aggressive_buy_use_ask1,
                 )
             except Exception as e:
                 log_lifeboat_buyback_rejected(
@@ -506,7 +823,9 @@ class ExitFSM:
             if int(res.order_id) <= 0:
                 self._trading.enter_freeze_mode(res.error or "BUYBACK_PLACE_ORDER_FAILED")
                 return None
-            _ = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+            final = self._trading.confirm_order(int(res.order_id), timeout_s=10.0)
+            if final.status != OrderStatus.FILLED:
+                return int(res.order_id)
             ps.lifeboat_used = True
             conditions = dict(ev.conditions)
             trigger2: dict[str, Any] = {"last_price": float(snap.last_price), "stop_price": float(stop_price)}
@@ -528,3 +847,7 @@ class ExitFSM:
             )
             self.save()
             return int(res.order_id)
+
+
+
+

@@ -1,0 +1,655 @@
+{
+  "date": "20240924",
+  "watchlist": [
+    {
+      "etf_code": "512480.SH",
+      "sentiment_score": 37,
+      "profit_ratio": 1.2698957908502218,
+      "nearest_resistance": 0.6950000000000001,
+      "micro_caution": true,
+      "vpin_rank": 0.9803921568627451,
+      "ofi_daily": -1.1113723805316533,
+      "vs_max": -0.6919184743011677,
+      "extra": {
+        "sentiment_score_01": 0.3671
+      }
+    },
+    {
+      "etf_code": "588200.SH",
+      "sentiment_score": 34,
+      "profit_ratio": 0.1809286667776703,
+      "nearest_resistance": 0.9450000000000001,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -0.49196054751456864,
+      "vs_max": -1.2806525644502669,
+      "extra": {
+        "sentiment_score_01": 0.3374
+      }
+    },
+    {
+      "etf_code": "159997.SZ",
+      "sentiment_score": 44,
+      "profit_ratio": 5.278249920325945,
+      "nearest_resistance": 0.783,
+      "micro_caution": true,
+      "vpin_rank": 0.896551724137931,
+      "ofi_daily": -0.9126664132461811,
+      "vs_max": -0.8521601333121316,
+      "extra": {
+        "sentiment_score_01": 0.4434
+      }
+    },
+    {
+      "etf_code": "159732.SZ",
+      "sentiment_score": 50,
+      "profit_ratio": 8.97235261899116,
+      "nearest_resistance": 0.629,
+      "micro_caution": true,
+      "vpin_rank": 0.8461538461538461,
+      "ofi_daily": -0.8881829681848437,
+      "vs_max": 0.12337039266161355,
+      "extra": {
+        "sentiment_score_01": 0.5025
+      }
+    },
+    {
+      "etf_code": "159852.SZ",
+      "sentiment_score": 65,
+      "profit_ratio": 57.65489671108786,
+      "nearest_resistance": 0.589,
+      "micro_caution": true,
+      "vpin_rank": 0.3125,
+      "ofi_daily": -0.16218629099051401,
+      "vs_max": 0.7405502463979082,
+      "extra": {
+        "sentiment_score_01": 0.6509
+      }
+    },
+    {
+      "etf_code": "159108.SZ",
+      "sentiment_score": 50,
+      "profit_ratio": 0.0,
+      "nearest_resistance": null,
+      "micro_caution": false,
+      "vpin_rank": null,
+      "ofi_daily": null,
+      "vs_max": null,
+      "extra": {
+        "sentiment_score_01": 0.5
+      }
+    },
+    {
+      "etf_code": "159998.SZ",
+      "sentiment_score": 63,
+      "profit_ratio": 39.09385445752718,
+      "nearest_resistance": 0.629,
+      "micro_caution": true,
+      "vpin_rank": 0.0196078431372549,
+      "ofi_daily": -0.6204285431980379,
+      "vs_max": -0.11444696757508216,
+      "extra": {
+        "sentiment_score_01": 0.6337
+      }
+    },
+    {
+      "etf_code": "516510.SH",
+      "sentiment_score": 64,
+      "profit_ratio": 38.15871305440503,
+      "nearest_resistance": 0.799,
+      "micro_caution": true,
+      "vpin_rank": 0.7924528301886793,
+      "ofi_daily": -1.4006132080753746,
+      "vs_max": -0.45193901925216684,
+      "extra": {
+        "sentiment_score_01": 0.6404
+      }
+    },
+    {
+      "etf_code": "562570.SH",
+      "sentiment_score": 76,
+      "profit_ratio": 23.325667726889765,
+      "nearest_resistance": 1.011,
+      "micro_caution": true,
+      "vpin_rank": 0.9743589743589743,
+      "ofi_daily": -0.36585584992977954,
+      "vs_max": 3.0,
+      "extra": {
+        "sentiment_score_01": 0.7558
+      }
+    },
+    {
+      "etf_code": "562920.SH",
+      "sentiment_score": 70,
+      "profit_ratio": 27.351729196542195,
+      "nearest_resistance": 0.669,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -0.585789887221284,
+      "vs_max": -2.5987565206998005,
+      "extra": {
+        "sentiment_score_01": 0.7039
+      }
+    },
+    {
+      "etf_code": "515880.SH",
+      "sentiment_score": 58,
+      "profit_ratio": 29.020616205771365,
+      "nearest_resistance": 1.154,
+      "micro_caution": true,
+      "vpin_rank": 0.9272727272727272,
+      "ofi_daily": -0.4102103083354422,
+      "vs_max": 0.060065250081467625,
+      "extra": {
+        "sentiment_score_01": 0.5799
+      }
+    },
+    {
+      "etf_code": "159811.SZ",
+      "sentiment_score": 38,
+      "profit_ratio": 5.54536669820998,
+      "nearest_resistance": 0.9770000000000001,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -0.3606211060809902,
+      "vs_max": -1.6729763080464974,
+      "extra": {
+        "sentiment_score_01": 0.3795
+      }
+    },
+    {
+      "etf_code": "159363.SZ",
+      "sentiment_score": 50,
+      "profit_ratio": 0.0,
+      "nearest_resistance": null,
+      "micro_caution": false,
+      "vpin_rank": null,
+      "ofi_daily": null,
+      "vs_max": null,
+      "extra": {
+        "sentiment_score_01": 0.5
+      }
+    },
+    {
+      "etf_code": "562500.SH",
+      "sentiment_score": 51,
+      "profit_ratio": 22.092233779973082,
+      "nearest_resistance": 0.56,
+      "micro_caution": true,
+      "vpin_rank": 0.9615384615384616,
+      "ofi_daily": -0.45809412936888955,
+      "vs_max": -0.0635023599845008,
+      "extra": {
+        "sentiment_score_01": 0.5068
+      }
+    },
+    {
+      "etf_code": "159550.SZ",
+      "sentiment_score": 50,
+      "profit_ratio": 0.0,
+      "nearest_resistance": null,
+      "micro_caution": false,
+      "vpin_rank": null,
+      "ofi_daily": null,
+      "vs_max": null,
+      "extra": {
+        "sentiment_score_01": 0.5
+      }
+    },
+    {
+      "etf_code": "512980.SH",
+      "sentiment_score": 54,
+      "profit_ratio": 24.724932270650736,
+      "nearest_resistance": 0.584,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -0.1328164663470525,
+      "vs_max": -1.197247927505374,
+      "extra": {
+        "sentiment_score_01": 0.5425
+      }
+    },
+    {
+      "etf_code": "515030.SH",
+      "sentiment_score": 64,
+      "profit_ratio": 11.584630117815847,
+      "nearest_resistance": 0.911,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -1.166985693584898,
+      "vs_max": -2.953401184424804,
+      "extra": {
+        "sentiment_score_01": 0.6361
+      }
+    },
+    {
+      "etf_code": "515250.SH",
+      "sentiment_score": 67,
+      "profit_ratio": 36.46744154157017,
+      "nearest_resistance": 0.788,
+      "micro_caution": true,
+      "vpin_rank": 0.8695652173913043,
+      "ofi_daily": 0.336015181321253,
+      "vs_max": -0.476876592222979,
+      "extra": {
+        "sentiment_score_01": 0.6665
+      }
+    },
+    {
+      "etf_code": "159755.SZ",
+      "sentiment_score": 38,
+      "profit_ratio": 8.119602684860709,
+      "nearest_resistance": 0.508,
+      "micro_caution": true,
+      "vpin_rank": 0.9210526315789473,
+      "ofi_daily": -0.22007245033212952,
+      "vs_max": -0.22239659008138324,
+      "extra": {
+        "sentiment_score_01": 0.3759
+      }
+    },
+    {
+      "etf_code": "515790.SH",
+      "sentiment_score": 34,
+      "profit_ratio": 2.0744898388653255,
+      "nearest_resistance": 0.663,
+      "micro_caution": true,
+      "vpin_rank": 0.9534883720930233,
+      "ofi_daily": -1.0323866418555527,
+      "vs_max": 0.1105799624974859,
+      "extra": {
+        "sentiment_score_01": 0.339
+      }
+    },
+    {
+      "etf_code": "159566.SZ",
+      "sentiment_score": 44,
+      "profit_ratio": 16.091944164666057,
+      "nearest_resistance": 1.063,
+      "micro_caution": true,
+      "vpin_rank": 0.9824561403508771,
+      "ofi_daily": -0.06836246986701466,
+      "vs_max": -0.5925177304034257,
+      "extra": {
+        "sentiment_score_01": 0.438
+      }
+    },
+    {
+      "etf_code": "588830.SH",
+      "sentiment_score": 34,
+      "profit_ratio": 0.45539804218411095,
+      "nearest_resistance": 0.9890000000000001,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -0.06758028565471505,
+      "vs_max": -2.005824194951935,
+      "extra": {
+        "sentiment_score_01": 0.3353
+      }
+    },
+    {
+      "etf_code": "588010.SH",
+      "sentiment_score": 32,
+      "profit_ratio": 5.507663834679917,
+      "nearest_resistance": 0.419,
+      "micro_caution": true,
+      "vpin_rank": 0.9545454545454546,
+      "ofi_daily": -0.5072332036696974,
+      "vs_max": -0.5099844036754799,
+      "extra": {
+        "sentiment_score_01": 0.3217
+      }
+    },
+    {
+      "etf_code": "159638.SZ",
+      "sentiment_score": 61,
+      "profit_ratio": 6.990016841518494,
+      "nearest_resistance": 0.624,
+      "micro_caution": true,
+      "vpin_rank": 0.75,
+      "ofi_daily": -1.0604440009681693,
+      "vs_max": -0.63616224248669,
+      "extra": {
+        "sentiment_score_01": 0.6068
+      }
+    },
+    {
+      "etf_code": "159667.SZ",
+      "sentiment_score": 44,
+      "profit_ratio": 6.194571876185005,
+      "nearest_resistance": 0.7470000000000001,
+      "micro_caution": true,
+      "vpin_rank": 0.5185185185185185,
+      "ofi_daily": -0.5531083636848263,
+      "vs_max": -1.145713917985221,
+      "extra": {
+        "sentiment_score_01": 0.439
+      }
+    },
+    {
+      "etf_code": "560280.SH",
+      "sentiment_score": 77,
+      "profit_ratio": 58.59499754259881,
+      "nearest_resistance": 1.102,
+      "micro_caution": true,
+      "vpin_rank": 0.21052631578947367,
+      "ofi_daily": -0.17553163631154337,
+      "vs_max": -0.018052080993336567,
+      "extra": {
+        "sentiment_score_01": 0.7672
+      }
+    },
+    {
+      "etf_code": "512710.SH",
+      "sentiment_score": 42,
+      "profit_ratio": 7.656569929845649,
+      "nearest_resistance": 0.51,
+      "micro_caution": true,
+      "vpin_rank": 0.9583333333333334,
+      "ofi_daily": -0.5457473076390494,
+      "vs_max": -1.0040151276286917,
+      "extra": {
+        "sentiment_score_01": 0.4158
+      }
+    },
+    {
+      "etf_code": "159227.SZ",
+      "sentiment_score": 50,
+      "profit_ratio": 0.0,
+      "nearest_resistance": null,
+      "micro_caution": false,
+      "vpin_rank": null,
+      "ofi_daily": null,
+      "vs_max": null,
+      "extra": {
+        "sentiment_score_01": 0.5
+      }
+    },
+    {
+      "etf_code": "159206.SZ",
+      "sentiment_score": 50,
+      "profit_ratio": 0.0,
+      "nearest_resistance": null,
+      "micro_caution": false,
+      "vpin_rank": null,
+      "ofi_daily": null,
+      "vs_max": null,
+      "extra": {
+        "sentiment_score_01": 0.5
+      }
+    },
+    {
+      "etf_code": "512010.SH",
+      "sentiment_score": 60,
+      "profit_ratio": 1.7566506671654811,
+      "nearest_resistance": 0.317,
+      "micro_caution": true,
+      "vpin_rank": 0.5535714285714286,
+      "ofi_daily": -0.992307592669442,
+      "vs_max": 0.5145436319004801,
+      "extra": {
+        "sentiment_score_01": 0.5984
+      }
+    },
+    {
+      "etf_code": "159992.SZ",
+      "sentiment_score": 31,
+      "profit_ratio": 2.969673453378605,
+      "nearest_resistance": 0.609,
+      "micro_caution": true,
+      "vpin_rank": 0.46,
+      "ofi_daily": -0.8927621836766051,
+      "vs_max": 0.22269237064505942,
+      "extra": {
+        "sentiment_score_01": 0.3096
+      }
+    },
+    {
+      "etf_code": "159883.SZ",
+      "sentiment_score": 67,
+      "profit_ratio": 0.956564911403571,
+      "nearest_resistance": 0.457,
+      "micro_caution": true,
+      "vpin_rank": 0.1702127659574468,
+      "ofi_daily": -0.23112691351549122,
+      "vs_max": 0.28111796987346416,
+      "extra": {
+        "sentiment_score_01": 0.6654
+      }
+    },
+    {
+      "etf_code": "560080.SH",
+      "sentiment_score": 55,
+      "profit_ratio": 8.280947135381203,
+      "nearest_resistance": 1.03,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -1.2148910662625279,
+      "vs_max": -0.7490417455277578,
+      "extra": {
+        "sentiment_score_01": 0.5523
+      }
+    },
+    {
+      "etf_code": "159859.SZ",
+      "sentiment_score": 42,
+      "profit_ratio": 8.081741532783376,
+      "nearest_resistance": 0.31200000000000006,
+      "micro_caution": true,
+      "vpin_rank": 0.15384615384615385,
+      "ofi_daily": -0.6974465668216263,
+      "vs_max": 0.15851609050999124,
+      "extra": {
+        "sentiment_score_01": 0.4208
+      }
+    },
+    {
+      "etf_code": "159928.SZ",
+      "sentiment_score": 51,
+      "profit_ratio": 8.859601313272016,
+      "nearest_resistance": 0.706,
+      "micro_caution": true,
+      "vpin_rank": 0.4339622641509434,
+      "ofi_daily": -0.07848547916447399,
+      "vs_max": 0.026893660536475166,
+      "extra": {
+        "sentiment_score_01": 0.5137
+      }
+    },
+    {
+      "etf_code": "515170.SH",
+      "sentiment_score": 62,
+      "profit_ratio": 13.254861834867812,
+      "nearest_resistance": 0.499,
+      "micro_caution": false,
+      "vpin_rank": 0.20454545454545456,
+      "ofi_daily": 0.22598251624025786,
+      "vs_max": 1.4159115497606554,
+      "extra": {
+        "sentiment_score_01": 0.6164
+      }
+    },
+    {
+      "etf_code": "512690.SH",
+      "sentiment_score": 49,
+      "profit_ratio": 12.107043853321647,
+      "nearest_resistance": 0.565,
+      "micro_caution": false,
+      "vpin_rank": 0.5555555555555556,
+      "ofi_daily": 0.26138992357339236,
+      "vs_max": 0.4726196235043511,
+      "extra": {
+        "sentiment_score_01": 0.4882
+      }
+    },
+    {
+      "etf_code": "159996.SZ",
+      "sentiment_score": 61,
+      "profit_ratio": 79.4940408251078,
+      "nearest_resistance": 1.22,
+      "micro_caution": true,
+      "vpin_rank": 0.660377358490566,
+      "ofi_daily": -0.3613233961537975,
+      "vs_max": 1.1058824151858158,
+      "extra": {
+        "sentiment_score_01": 0.607
+      }
+    },
+    {
+      "etf_code": "159825.SZ",
+      "sentiment_score": 41,
+      "profit_ratio": 5.481710719580306,
+      "nearest_resistance": 0.595,
+      "micro_caution": true,
+      "vpin_rank": 0.05555555555555555,
+      "ofi_daily": -0.04368728975652887,
+      "vs_max": -0.13464952412959655,
+      "extra": {
+        "sentiment_score_01": 0.4142
+      }
+    },
+    {
+      "etf_code": "159865.SZ",
+      "sentiment_score": 71,
+      "profit_ratio": 5.765540779803207,
+      "nearest_resistance": 0.514,
+      "micro_caution": true,
+      "vpin_rank": 0.1282051282051282,
+      "ofi_daily": -0.37671688388949953,
+      "vs_max": -0.13803322298683435,
+      "extra": {
+        "sentiment_score_01": 0.7123
+      }
+    },
+    {
+      "etf_code": "512880.SH",
+      "sentiment_score": 55,
+      "profit_ratio": 64.78751700336886,
+      "nearest_resistance": null,
+      "micro_caution": true,
+      "vpin_rank": 0.8478260869565217,
+      "ofi_daily": 0.02585708425536322,
+      "vs_max": -0.11112158814646594,
+      "extra": {
+        "sentiment_score_01": 0.5516
+      }
+    },
+    {
+      "etf_code": "512800.SH",
+      "sentiment_score": 56,
+      "profit_ratio": 40.9529747436372,
+      "nearest_resistance": 1.262,
+      "micro_caution": false,
+      "vpin_rank": 0.45,
+      "ofi_daily": 0.367769558817793,
+      "vs_max": 0.8083848074865644,
+      "extra": {
+        "sentiment_score_01": 0.558
+      }
+    },
+    {
+      "etf_code": "512070.SH",
+      "sentiment_score": 61,
+      "profit_ratio": 89.48100969558743,
+      "nearest_resistance": null,
+      "micro_caution": false,
+      "vpin_rank": 0.28846153846153844,
+      "ofi_daily": 0.20278996820254605,
+      "vs_max": -0.202764045863236,
+      "extra": {
+        "sentiment_score_01": 0.6083
+      }
+    },
+    {
+      "etf_code": "512200.SH",
+      "sentiment_score": 70,
+      "profit_ratio": 96.72652386541894,
+      "nearest_resistance": null,
+      "micro_caution": false,
+      "vpin_rank": null,
+      "ofi_daily": 1.1248887365732294,
+      "vs_max": -0.7559215755924436,
+      "extra": {
+        "sentiment_score_01": 0.6979
+      }
+    },
+    {
+      "etf_code": "516970.SH",
+      "sentiment_score": 59,
+      "profit_ratio": 24.924349937070133,
+      "nearest_resistance": 0.994,
+      "micro_caution": true,
+      "vpin_rank": 0.8461538461538461,
+      "ofi_daily": 0.9135857025621213,
+      "vs_max": -0.05639214976086774,
+      "extra": {
+        "sentiment_score_01": 0.5949
+      }
+    },
+    {
+      "etf_code": "512400.SH",
+      "sentiment_score": 62,
+      "profit_ratio": 24.279264123207508,
+      "nearest_resistance": 0.921,
+      "micro_caution": true,
+      "vpin_rank": 0.9655172413793104,
+      "ofi_daily": -0.16113511540331837,
+      "vs_max": -0.2242832031881336,
+      "extra": {
+        "sentiment_score_01": 0.6218
+      }
+    },
+    {
+      "etf_code": "516150.SH",
+      "sentiment_score": 65,
+      "profit_ratio": 12.33924662984502,
+      "nearest_resistance": 0.794,
+      "micro_caution": true,
+      "vpin_rank": 0.05,
+      "ofi_daily": -0.5638503668599416,
+      "vs_max": 0.24800616323434374,
+      "extra": {
+        "sentiment_score_01": 0.6474
+      }
+    },
+    {
+      "etf_code": "515220.SH",
+      "sentiment_score": 31,
+      "profit_ratio": 25.80581804396001,
+      "nearest_resistance": 1.109,
+      "micro_caution": true,
+      "vpin_rank": 0.5,
+      "ofi_daily": -0.1267958617281505,
+      "vs_max": 0.19756668446337336,
+      "extra": {
+        "sentiment_score_01": 0.3064
+      }
+    },
+    {
+      "etf_code": "515210.SH",
+      "sentiment_score": 43,
+      "profit_ratio": 18.618289180443366,
+      "nearest_resistance": 1.012,
+      "micro_caution": true,
+      "vpin_rank": 0.7894736842105263,
+      "ofi_daily": 0.5130991050890676,
+      "vs_max": 0.5563307759550206,
+      "extra": {
+        "sentiment_score_01": 0.4336
+      }
+    },
+    {
+      "etf_code": "159870.SZ",
+      "sentiment_score": 64,
+      "profit_ratio": 12.697572255090678,
+      "nearest_resistance": 0.497,
+      "micro_caution": true,
+      "vpin_rank": null,
+      "ofi_daily": -0.73079794808386,
+      "vs_max": -1.319611442918743,
+      "extra": {
+        "sentiment_score_01": 0.6414
+      }
+    }
+  ]
+}

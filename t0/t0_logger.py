@@ -9,6 +9,8 @@ from .types import BreakerDecision, ReconciliationResult, RegimeResult, RoundTri
 
 
 def _append_jsonl(*, log_path: str | Path, obj: dict[str, Any]) -> None:
+    if not str(log_path).strip():
+        return
     p = Path(log_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, ensure_ascii=False)

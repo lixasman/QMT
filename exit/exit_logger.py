@@ -9,6 +9,8 @@ from core.enums import DataQuality
 
 
 def _append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    if str(path).strip() in ("", "."):
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(obj, ensure_ascii=False)
     with path.open("a", encoding="utf-8") as f:
@@ -62,6 +64,25 @@ def log_layer2_reduce(
     _append_jsonl(p, payload)
 
 
+def log_layer2_score(
+    *,
+    log_path: str | Path,
+    timestamp: datetime,
+    etf_code: str,
+    score_soft: float,
+    signals: dict[str, Any],
+) -> None:
+    p = Path(log_path)
+    payload: dict[str, Any] = {
+        "type": "LAYER2_SCORE",
+        "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "etf_code": str(etf_code),
+        "score_soft": float(score_soft),
+        "signals": signals,
+    }
+    _append_jsonl(p, payload)
+
+
 def log_lifeboat_buyback(
     *,
     log_path: str | Path,
@@ -110,4 +131,3 @@ def log_lifeboat_buyback_rejected(
 
 def serialize_data_health(health: Mapping[str, DataQuality]) -> dict[str, str]:
     return {str(k): str(v.value) for k, v in health.items()}
-

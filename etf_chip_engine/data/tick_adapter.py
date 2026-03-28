@@ -5,6 +5,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+_LOT_SIZE = 100.0
+
 
 def ticks_to_snapshots(ticks: Any) -> pd.DataFrame:
     base_cols = ["time", "open", "high", "low", "close", "volume", "amount", "bid1", "bid1_vol", "ask1", "ask1_vol"]
@@ -103,7 +105,8 @@ def ticks_to_snapshots(ticks: Any) -> pd.DataFrame:
         if volume_delta.size:
             volume_delta[0] = 0.0
         amount_delta = np.maximum(amount_delta, 0.0)
-        volume_delta = np.maximum(volume_delta, 0.0)
+        # XtData tick.volume 为“手”，引擎内部统一换算为“股/份”。
+        volume_delta = np.maximum(volume_delta, 0.0) * _LOT_SIZE
 
         high_monotone = np.all(np.diff(high_raw) >= -1e-12) if high_raw.size >= 2 else False
         low_monotone = np.all(np.diff(low_raw) <= 1e-12) if low_raw.size >= 2 else False
@@ -182,7 +185,7 @@ def ticks_to_snapshots(ticks: Any) -> pd.DataFrame:
     if volume_delta.size:
         volume_delta[0] = 0.0
     amount_delta = np.maximum(amount_delta, 0.0)
-    volume_delta = np.maximum(volume_delta, 0.0)
+    volume_delta = np.maximum(volume_delta, 0.0) * _LOT_SIZE
 
     high_monotone = np.all(np.diff(high_raw) >= -1e-12) if high_raw.size >= 2 else False
     low_monotone = np.all(np.diff(low_raw) <= 1e-12) if low_raw.size >= 2 else False

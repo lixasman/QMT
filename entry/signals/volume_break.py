@@ -24,11 +24,10 @@ def compute_volume_break(bars: list[Bar], resistance_price: Optional[float]) -> 
 
     vol_ma20 = sum(float(b.volume) for b in bars[t - 20 : t]) / 20.0
     vol_ratio = (vol_t / vol_ma20) if vol_ma20 > 0 else 0.0
-    volume_confirm = bool(vol_ratio >= 2.0)
+    volume_confirm = bool(vol_ratio >= 1.5)
 
     denom = max(high_t - low_t, 0.001)
     body_ratio = (close_t - open_t) / denom
     solid_candle = bool(body_ratio > 0.5)
 
     return 1 if (price_break and volume_confirm and solid_candle) else 0
-

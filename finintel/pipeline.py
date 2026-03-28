@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 import requests
 
+from core.warn_utils import warn_once
 from newsget.ingestion import fetch_top10_news
 from newsget.models import NewsItem
 
@@ -53,8 +54,12 @@ def extract_json_object(text: str) -> dict[str, Any]:
         obj = json.loads(text)
         if isinstance(obj, dict):
             return obj
-    except Exception:
-        pass
+    except Exception as e:
+        warn_once(
+            "finintel_extract_json_fallback",
+            f"FinIntel: DeepSeek 返回非严格JSON，已降级使用正则提取JSON片段。err={repr(e)}",
+            logger_name=__name__,
+        )
 
     m = re.search(r"\{[\s\S]*\}", text)
     if not m:

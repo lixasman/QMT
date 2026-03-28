@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from typing import Optional
 
+from core.buy_order_config import get_aggressive_buy_multiplier, get_aggressive_buy_use_ask1
 from core.constants import ENTRY_CUTOFF_TIME
 from core.enums import ActionType, DataQuality, OrderSide, OrderType
 from core.interfaces import InstrumentInfo, OrderRequest, TickSnapshot
@@ -11,6 +12,12 @@ from core.price_utils import align_order_price
 from core.validators import assert_action_allowed
 
 from .constants import GAP_ATR_FACTOR, GAP_THRESHOLD_MIN, IOPV_PREMIUM_CONFIRM, IOPV_PREMIUM_TRIAL
+from .pathb_config import (
+    get_pathb_atr_mult,
+    get_pathb_chip_min,
+    get_pathb_require_trend,
+    get_pathb_require_vwap_strict,
+)
 from .types import ConfirmAction, ConfirmActionType
 from .vwap_tracker import VwapTracker
 
@@ -24,12 +31,31 @@ class Phase3Context:
     atr_20: float
     expire_yyyymmdd: str
     strong: bool
+    s_trend: float = 0.0
+    s_chip_pr: float = 0.0
 
 
 class Phase3Confirmer:
-    def __init__(self, ctx: Phase3Context, vwap: VwapTracker) -> None:
+    def __init__(
+        self,
+        ctx: Phase3Context,
+        vwap: VwapTracker,
+        *,
+        aggressive_buy_multiplier: Optional[float] = None,
+        aggressive_buy_use_ask1: Optional[bool] = None,
+        pathb_atr_mult: Optional[float] = None,
+        pathb_chip_min: Optional[float] = None,
+        pathb_require_trend: Optional[bool] = None,
+        pathb_require_vwap_strict: Optional[bool] = None,
+    ) -> None:
         self._ctx = ctx
         self._vwap = vwap
+        self._aggressive_buy_multiplier = aggressive_buy_multiplier
+        self._aggressive_buy_use_ask1 = aggressive_buy_use_ask1
+        self._pathb_atr_mult = pathb_atr_mult
+        self._pathb_chip_min = pathb_chip_min
+        self._pathb_require_trend = pathb_require_trend
+        self._pathb_require_vwap_strict = pathb_require_vwap_strict
 
     def decide(
         self,
@@ -68,9 +94,7 @@ class Phase3Confirmer:
 
         gap_ratio = (last_price - h_signal) / h_signal if h_signal > 0 else 0.0
         gap_threshold = max(float(GAP_THRESHOLD_MIN), float(GAP_ATR_FACTOR) * atr / close_t) if close_t > 0 else float(GAP_THRESHOLD_MIN)
-
-        a_breakout_pass = bool(last_price > h_signal)
-        a_gap_pass = bool(gap_ratio <= (gap_threshold + 1e-12))
+        gap_threshold_with_tolerance = gap_threshold + 1e-12
 
         warmup_active = self._vwap.is_warmup(now)
         if warmup_active:
@@ -82,6 +106,24 @@ class Phase3Confirmer:
             used_vwap_slope = True
             slope_vals = list(self._vwap.anchor_vwaps[-3:]) if len(self._vwap.anchor_vwaps) >= 3 else list(self._vwap.anchor_vwaps)
 
+        a_breakout_pass = bool(last_price > h_signal)
+        pathb_mult = float(get_pathb_atr_mult()) if self._pathb_atr_mult is None else float(self._pathb_atr_mult)
+        pathb_floor = float(h_signal) - float(pathb_mult) * float(atr)
+        chip_min = float(get_pathb_chip_min()) if self._pathb_chip_min is None else float(self._pathb_chip_min)
+        require_trend = bool(get_pathb_require_trend()) if self._pathb_require_trend is None else bool(self._pathb_require_trend)
+        require_vwap_strict = (
+            bool(get_pathb_require_vwap_strict())
+            if self._pathb_require_vwap_strict is None
+            else bool(self._pathb_require_vwap_strict)
+        )
+        trend_ok = bool((not require_trend) or float(self._ctx.s_trend) >= 1.0)
+        chip_ok = bool(float(self._ctx.s_chip_pr) >= chip_min)
+        vwap_ok = bool(b_pass and (not require_vwap_strict or not warmup_active))
+        b_breakout_pass = bool(last_price >= close_t and last_price >= pathb_floor and trend_ok and chip_ok and vwap_ok)
+        breakout_pass = bool(a_breakout_pass or b_breakout_pass)
+        a_gap_pass = bool(gap_ratio <= gap_threshold_with_tolerance)
+        gap_exceeded = bool(gap_ratio > gap_threshold_with_tolerance)
+
         premium_threshold = float(IOPV_PREMIUM_TRIAL if is_trial else IOPV_PREMIUM_CONFIRM)
         if snapshot.iopv is None:
             c_pass = True
@@ -91,10 +133,24 @@ class Phase3Confirmer:
             premium = (last_price - iopv) / iopv if iopv > 0 else 0.0
             c_pass = bool(premium <= premium_threshold)
 
-        all_pass = bool(a_breakout_pass and a_gap_pass and b_pass and c_pass)
+        all_pass = bool(breakout_pass and a_gap_pass and b_pass and c_pass)
 
         conditions = {
-            "a_price_breakout": {"pass": a_breakout_pass, "last_price": last_price, "H_signal": h_signal},
+            "a_price_breakout": {
+                "pass": breakout_pass,
+                "path_a": a_breakout_pass,
+                "path_b": b_breakout_pass,
+                "last_price": last_price,
+                "H_signal": h_signal,
+                "close_signal_day": close_t,
+                "atr_20": atr,
+                "pathb_mult": pathb_mult,
+                "pathb_floor": pathb_floor,
+                "pathb_chip_min": chip_min,
+                "pathb_chip_ok": chip_ok,
+                "pathb_trend_ok": trend_ok,
+                "pathb_vwap_ok": vwap_ok,
+            },
             "a_gap_check": {"pass": a_gap_pass, "gap_ratio": gap_ratio, "threshold": gap_threshold},
             "b_vwap_slope": {"pass": b_pass, "warmup_active": warmup_active, "slope_values": slope_vals},
             "c_iopv_premium": {"pass": c_pass, "premium": premium, "threshold": premium_threshold},
@@ -103,7 +159,7 @@ class Phase3Confirmer:
         }
 
         if not all_pass:
-            if not a_breakout_pass:
+            if not breakout_pass:
                 reason = "NO_BREAKOUT"
             elif not a_gap_pass:
                 reason = "GAP_TOO_LARGE"
@@ -112,13 +168,21 @@ class Phase3Confirmer:
             else:
                 reason = "IOPV_PREMIUM_TOO_HIGH"
             act = ConfirmAction(action=ConfirmActionType.REJECT, reason=reason, conditions=conditions, used_vwap_slope=used_vwap_slope)
-            if gap_ratio > gap_threshold:
+            if gap_exceeded:
                 assert act.action != ConfirmActionType.CONFIRM_ENTRY
             if now.time() < time(9, 50):
                 assert not used_vwap_slope
             return act
 
-        raw_price = float(snapshot.ask1_price) * 1.003
+        raw_price = float(snapshot.ask1_price)
+        use_ask1 = bool(get_aggressive_buy_use_ask1()) if self._aggressive_buy_use_ask1 is None else bool(self._aggressive_buy_use_ask1)
+        buy_multiplier = (
+            float(get_aggressive_buy_multiplier())
+            if self._aggressive_buy_multiplier is None
+            else float(self._aggressive_buy_multiplier)
+        )
+        if not bool(use_ask1):
+            raw_price = float(raw_price) * float(buy_multiplier)
         buy_price = align_order_price(price=raw_price, side="BUY", lower_limit=float(instrument.limit_down), upper_limit=float(instrument.limit_up), tick_size=float(instrument.price_tick))
         order = OrderRequest(
             etf_code=self._ctx.etf_code,
@@ -131,7 +195,7 @@ class Phase3Confirmer:
         )
 
         act2 = ConfirmAction(action=ConfirmActionType.CONFIRM_ENTRY, reason="", conditions=conditions, order=order, used_vwap_slope=used_vwap_slope)
-        if gap_ratio > gap_threshold:
+        if gap_exceeded:
             assert act2.action != ConfirmActionType.CONFIRM_ENTRY
         if now.time() < time(9, 50):
             assert not used_vwap_slope

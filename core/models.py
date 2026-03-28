@@ -302,7 +302,11 @@ class PositionState:
     cooldown_until: str = ""
     lifeboat_used: bool = False
     lifeboat_sell_time: str = ""
+    lifeboat_tight_stop: float = 0.0
+    last_lifeboat_buyback_date: str = ""
+    last_corporate_action_date: str = ""
     auction_volume_history: list[float] = field(default_factory=list)
+    same_day_buy_qty: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -330,7 +334,11 @@ class PositionState:
             "cooldown_until": self.cooldown_until,
             "lifeboat_used": bool(self.lifeboat_used),
             "lifeboat_sell_time": self.lifeboat_sell_time,
+            "lifeboat_tight_stop": float(self.lifeboat_tight_stop),
+            "last_lifeboat_buyback_date": self.last_lifeboat_buyback_date,
+            "last_corporate_action_date": self.last_corporate_action_date,
             "auction_volume_history": [float(x) for x in self.auction_volume_history],
+            "same_day_buy_qty": int(self.same_day_buy_qty),
         }
 
     @classmethod
@@ -360,6 +368,10 @@ class PositionState:
             cooldown_until=str(d.get("cooldown_until") or ""),
             lifeboat_used=bool(d.get("lifeboat_used") or False),
             lifeboat_sell_time=str(d.get("lifeboat_sell_time") or ""),
+            lifeboat_tight_stop=float(d.get("lifeboat_tight_stop") or 0.0),
+            last_lifeboat_buyback_date=str(d.get("last_lifeboat_buyback_date") or ""),
+            last_corporate_action_date=str(d.get("last_corporate_action_date") or ""),
+            same_day_buy_qty=int(d.get("same_day_buy_qty") or 0),
         )
         ps.pending_sell_locked = [
             PendingSell.from_dict(x) for x in (d.get("pending_sell_locked") or []) if isinstance(x, dict)
@@ -385,6 +397,9 @@ class PortfolioState:
     correlation_matrix_date: str = ""
     pending_entries: list[PendingEntry] = field(default_factory=list)
     locked_orders: list[LockedOrder] = field(default_factory=list)
+    exit_order_intents: dict[str, dict[str, Any]] = field(default_factory=dict)
+    phase2_high_chase_signals: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    corporate_action_markers: dict[str, str] = field(default_factory=dict)
     preemption_active: bool = False
     preempt_buy_order_id: Optional[int] = None
     preempt_weak_sell_order_id: Optional[int] = None
@@ -400,6 +415,32 @@ class PortfolioState:
             "correlation_matrix_date": self.correlation_matrix_date,
             "pending_entries": [p.to_dict() for p in self.pending_entries],
             "locked_orders": [o.to_dict() for o in self.locked_orders],
+            "exit_order_intents": {
+                str(k): {
+                    "action": str((v or {}).get("action") or ""),
+                    "etf_code": str((v or {}).get("etf_code") or ""),
+                    "locked_qty": int((v or {}).get("locked_qty") or 0),
+                    "expected_remaining_qty": int((v or {}).get("expected_remaining_qty") or 0),
+                }
+                for k, v in self.exit_order_intents.items()
+                if str(k).strip() and isinstance(v, dict) and str((v or {}).get("action") or "").strip()
+            },
+            "phase2_high_chase_signals": {
+                str(k): [
+                    {
+                        "signal_date": str(item.get("signal_date") or ""),
+                        "ref_price": float(item.get("ref_price") or 0.0),
+                    }
+                    for item in list(v)
+                    if isinstance(item, dict)
+                ]
+                for k, v in self.phase2_high_chase_signals.items()
+            },
+            "corporate_action_markers": {
+                str(k): str(v)
+                for k, v in self.corporate_action_markers.items()
+                if str(k).strip() and str(v).strip()
+            },
             "preemption_active": bool(self.preemption_active),
             "preempt_buy_order_id": (None if self.preempt_buy_order_id is None else int(self.preempt_buy_order_id)),
             "preempt_weak_sell_order_id": (None if self.preempt_weak_sell_order_id is None else int(self.preempt_weak_sell_order_id)),
@@ -430,4 +471,48 @@ class PortfolioState:
             st.circuit_breaker = CircuitBreakerInfo.from_dict(cb)
         st.pending_entries = [PendingEntry.from_dict(x) for x in (d.get("pending_entries") or []) if isinstance(x, dict)]
         st.locked_orders = [LockedOrder.from_dict(x) for x in (d.get("locked_orders") or []) if isinstance(x, dict)]
+        raw_exit_order_intents = d.get("exit_order_intents") or {}
+        if isinstance(raw_exit_order_intents, dict):
+            parsed_exit_order_intents: dict[str, dict[str, Any]] = {}
+            for k, v in raw_exit_order_intents.items():
+                if not isinstance(v, dict):
+                    continue
+                action = str(v.get("action") or "").strip()
+                if not action:
+                    continue
+                parsed_exit_order_intents[str(k)] = {
+                    "action": str(action),
+                    "etf_code": str(v.get("etf_code") or ""),
+                    "locked_qty": int(v.get("locked_qty") or 0),
+                    "expected_remaining_qty": int(v.get("expected_remaining_qty") or 0),
+                }
+            st.exit_order_intents = parsed_exit_order_intents
+        raw_high_chase = d.get("phase2_high_chase_signals") or {}
+        if isinstance(raw_high_chase, dict):
+            parsed: dict[str, list[dict[str, Any]]] = {}
+            for k, rows in raw_high_chase.items():
+                if not isinstance(rows, list):
+                    continue
+                kept: list[dict[str, Any]] = []
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    signal_date = str(item.get("signal_date") or "")
+                    try:
+                        ref_price = float(item.get("ref_price") or 0.0)
+                    except Exception:
+                        continue
+                    if not signal_date or ref_price <= 0:
+                        continue
+                    kept.append({"signal_date": signal_date, "ref_price": float(ref_price)})
+                if kept:
+                    parsed[str(k)] = kept
+            st.phase2_high_chase_signals = parsed
+        raw_corporate_markers = d.get("corporate_action_markers") or {}
+        if isinstance(raw_corporate_markers, dict):
+            st.corporate_action_markers = {
+                str(k): str(v)
+                for k, v in raw_corporate_markers.items()
+                if str(k).strip() and str(v).strip()
+            }
         return st

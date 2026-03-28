@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from core.buy_order_config import set_aggressive_buy_pricing
 from core.enums import DataQuality
 from core.interfaces import InstrumentInfo, TickSnapshot
 from core.time_utils import set_trading_calendar_provider
 
-from exit.layer1 import check_deadwater, check_gap_protection, decide_full_exit, decide_layer1_on_trigger, should_freeze_t0
+from exit.exit_config import get_exit_layer2_threshold, set_exit_layer1_order_pricing, set_exit_layer2_threshold
+from exit.layer1 import check_deadwater, check_gap_protection, check_stop_break, decide_full_exit, decide_layer1_on_trigger, should_freeze_t0
 from exit.lifeboat import evaluate_buyback, plan_lifeboat_buyback
 from exit.scoring import compute_score_soft
 
@@ -39,32 +41,38 @@ def _snap(*, ts: datetime, last: float, bid1: float, ask1: float, quality: DataQ
 
 
 def test_layer2_scoring_scenarios_1_7() -> None:
-    r = compute_score_soft({"S_chip": 0.0, "S_sentiment": 0.0, "S_diverge": 0.0, "S_time": 1.0})
-    assert r.score_soft == 0.40
-    assert r.triggered is False
+    original_threshold = float(get_exit_layer2_threshold())
+    try:
+        set_exit_layer2_threshold(0.9)
 
-    r = compute_score_soft({"S_chip": 0.5, "S_sentiment": 0.0, "S_diverge": 0.0, "S_time": 1.0})
-    assert r.score_soft == 0.75
-    assert r.triggered is False
+        r = compute_score_soft({"S_chip": 0.0, "S_sentiment": 0.0, "S_diverge": 0.0, "S_time": 1.0})
+        assert r.score_soft == 0.40
+        assert r.triggered is False
 
-    r = compute_score_soft({"S_chip": 0.5, "S_sentiment": 1.0, "S_diverge": 0.0, "S_time": 0.0})
-    assert r.score_soft == 1.05
-    assert r.triggered is True
+        r = compute_score_soft({"S_chip": 0.5, "S_sentiment": 0.0, "S_diverge": 0.0, "S_time": 1.0})
+        assert r.score_soft == 0.75
+        assert r.triggered is False
 
-    r = compute_score_soft({"S_chip": 0.0, "S_sentiment": 1.0, "S_diverge": 1.0, "S_time": 0.0})
-    assert r.score_soft == 1.20
-    assert r.triggered is True
+        r = compute_score_soft({"S_chip": 0.5, "S_sentiment": 1.0, "S_diverge": 0.0, "S_time": 0.0})
+        assert r.score_soft == 1.05
+        assert r.triggered is True
 
-    r = compute_score_soft({"S_chip": 0.5, "S_sentiment": 0.0, "S_diverge": 1.0, "S_time": 1.0})
-    assert r.score_soft == 1.25
-    assert r.triggered is True
+        r = compute_score_soft({"S_chip": 0.0, "S_sentiment": 1.0, "S_diverge": 1.0, "S_time": 0.0})
+        assert r.score_soft == 1.20
+        assert r.triggered is True
 
-    r = compute_score_soft({"S_chip": 1.0, "S_sentiment": 1.0, "S_diverge": 1.0, "S_time": 1.0})
-    assert r.score_soft == 2.30
-    assert r.triggered is True
+        r = compute_score_soft({"S_chip": 0.5, "S_sentiment": 0.0, "S_diverge": 1.0, "S_time": 1.0})
+        assert r.score_soft == 1.25
+        assert r.triggered is True
 
-    r = compute_score_soft({"S_chip": 0.0, "S_sentiment": 0.0, "S_diverge": 0.0, "S_time": 0.0})
-    assert r.score_soft == 0.00
+        r = compute_score_soft({"S_chip": 1.0, "S_sentiment": 1.0, "S_diverge": 1.0, "S_time": 1.0})
+        assert r.score_soft == 2.30
+        assert r.triggered is True
+
+        r = compute_score_soft({"S_chip": 0.0, "S_sentiment": 0.0, "S_diverge": 0.0, "S_time": 0.0})
+        assert r.score_soft == 0.00
+    finally:
+        set_exit_layer2_threshold(original_threshold)
 
 
 def test_layer1_triggered_scenarios_8_11() -> None:
@@ -73,6 +81,13 @@ def test_layer1_triggered_scenarios_8_11() -> None:
     snap = _snap(ts=now, last=0.895, bid1=0.894, ask1=0.896)
     stop = 0.900
     data_ok = {"S_chip": DataQuality.OK, "S_sentiment": DataQuality.OK, "S_diverge": DataQuality.OK, "S_time": DataQuality.OK}
+
+    trig = check_stop_break(last_price=0.900, stop_price=stop, price_tick=inst.price_tick)
+    assert trig.triggered is False
+    trig = check_stop_break(last_price=0.8991, stop_price=stop, price_tick=inst.price_tick)
+    assert trig.triggered is True
+    trig = check_stop_break(last_price=0.8990, stop_price=stop, price_tick=inst.price_tick)
+    assert trig.triggered is True
 
     d = decide_layer1_on_trigger(
         etf_code=inst.etf_code,
@@ -143,6 +158,54 @@ def test_layer1_triggered_scenarios_8_11() -> None:
     assert d.order.quantity == 1050
 
 
+def test_full_exit_can_price_at_stop_when_enabled() -> None:
+    inst = _inst()
+    now = datetime(2026, 2, 23, 10, 0, 0)
+    snap = _snap(ts=now, last=0.895, bid1=0.894, ask1=0.896)
+    set_exit_layer1_order_pricing(sell_discount=0.98, use_stop_price=True)
+    try:
+        d = decide_full_exit(
+            etf_code=inst.etf_code,
+            instrument=inst,
+            snapshot=snap,
+            reason="SOFT_SCORE_POSITIVE",
+            sellable_qty=1000,
+            total_qty=1000,
+            locked_qty=0,
+            stop_price=0.900,
+        )
+        assert d.order is not None
+        assert d.order.price == 0.900
+    finally:
+        set_exit_layer1_order_pricing(sell_discount=0.98, use_stop_price=False)
+
+
+def test_lifeboat_sell_can_price_at_stop_when_enabled() -> None:
+    inst = _inst()
+    now = datetime(2026, 2, 23, 10, 0, 0)
+    snap = _snap(ts=now, last=0.895, bid1=0.894, ask1=0.896)
+    data_ok = {"S_chip": DataQuality.OK, "S_sentiment": DataQuality.OK, "S_diverge": DataQuality.OK, "S_time": DataQuality.OK}
+    set_exit_layer1_order_pricing(sell_discount=0.98, use_stop_price=True)
+    try:
+        d = decide_layer1_on_trigger(
+            etf_code=inst.etf_code,
+            instrument=inst,
+            snapshot=snap,
+            stop_price=0.900,
+            score_soft=0.0,
+            data_health=data_ok,
+            lifeboat_used=False,
+            total_qty=1500,
+            sellable_qty=1500,
+            now=now,
+        )
+        assert d.action == "LIFEBOAT_70_30"
+        assert d.order is not None
+        assert d.order.price == 0.900
+    finally:
+        set_exit_layer1_order_pricing(sell_discount=0.98, use_stop_price=False)
+
+
 def test_lifeboat_buyback_scenarios_12_17() -> None:
     set_trading_calendar_provider(lambda s, e: [s] if s == e else [s, e])
     inst = _inst()
@@ -182,6 +245,36 @@ def test_lifeboat_buyback_scenarios_12_17() -> None:
     assert ev.passed is True
     plan = plan_lifeboat_buyback(instrument=inst, snapshot=snap, current_total_qty=3000, trading_minutes_elapsed=30, now=now)
     assert plan.buy_qty == 7000
+
+    stop_reentry = 0.920
+    snap = _snap(ts=now, last=0.921, bid1=0.920, ask1=0.922)
+    ev = evaluate_buyback(
+        instrument=inst,
+        snapshot=snap,
+        stop_price=stop_reentry,
+        score_soft=0.0,
+        data_health=data_ok,
+        lifeboat_used=False,
+        lifeboat_sell_time=sell_time,
+        current_total_qty=3000,
+        now=now,
+    )
+    assert ev.passed is False
+    assert ev.conditions["b_price_above_stop"]["required_price"] == 0.922
+
+    snap = _snap(ts=now, last=0.922, bid1=0.921, ask1=0.923)
+    ev = evaluate_buyback(
+        instrument=inst,
+        snapshot=snap,
+        stop_price=stop_reentry,
+        score_soft=0.0,
+        data_health=data_ok,
+        lifeboat_used=False,
+        lifeboat_sell_time=sell_time,
+        current_total_qty=3000,
+        now=now,
+    )
+    assert ev.passed is True
 
     sell_time = datetime(2026, 2, 23, 11, 20, 0)
     now = datetime(2026, 2, 23, 13, 15, 0)
@@ -250,11 +343,33 @@ def test_lifeboat_buyback_scenarios_12_17() -> None:
     assert ev.conditions["e_not_dead_cat"]["pass"] is False
 
 
+def test_lifeboat_buyback_can_use_ask1_directly() -> None:
+    inst = _inst()
+    now = datetime(2026, 2, 23, 10, 30, 0)
+    snap = _snap(ts=now, last=0.925, bid1=0.924, ask1=0.926)
+    set_aggressive_buy_pricing(multiplier=1.003, use_ask1=True)
+    try:
+        plan = plan_lifeboat_buyback(
+            instrument=inst,
+            snapshot=snap,
+            current_total_qty=3000,
+            trading_minutes_elapsed=30,
+            now=now,
+        )
+        assert plan.buy_price == 0.926
+    finally:
+        set_aggressive_buy_pricing(multiplier=1.003, use_ask1=False)
+
+
 def test_gap_deadwater_t0_scenarios_18_22() -> None:
     inst = _inst()
     stop = 1.000
 
     now = datetime(2026, 2, 23, 9, 25, 0)
+    snap = _snap(ts=now, last=stop * 0.96, bid1=0.959, ask1=0.961)
+    trig = check_gap_protection(now_time=now.time(), last_price=snap.last_price, stop_price=stop)
+    assert trig.triggered is True
+    now = datetime(2026, 2, 23, 9, 25, 10)
     snap = _snap(ts=now, last=stop * 0.96, bid1=0.959, ask1=0.961)
     trig = check_gap_protection(now_time=now.time(), last_price=snap.last_price, stop_price=stop)
     assert trig.triggered is True
@@ -270,6 +385,10 @@ def test_gap_deadwater_t0_scenarios_18_22() -> None:
     assert d.action == "FULL_EXIT"
 
     now = datetime(2026, 2, 23, 13, 0, 0)
+    snap = _snap(ts=now, last=stop * 0.95, bid1=0.949, ask1=0.951)
+    trig = check_gap_protection(now_time=now.time(), last_price=snap.last_price, stop_price=stop)
+    assert trig.triggered is True
+    now = datetime(2026, 2, 23, 13, 0, 20)
     snap = _snap(ts=now, last=stop * 0.95, bid1=0.949, ask1=0.951)
     trig = check_gap_protection(now_time=now.time(), last_price=snap.last_price, stop_price=stop)
     assert trig.triggered is True

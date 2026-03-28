@@ -26,3 +26,15 @@ def test_position_sizing_risk_parity() -> None:
     s2 = compute_position_sizing(current_nav=200000.0, atr_pct_raw=0.02, strong=True)
     assert s2.trial_amt > s.trial_amt
 
+
+def test_position_sizing_supports_scaled_account_caps() -> None:
+    s = compute_position_sizing(
+        current_nav=200000.0,
+        atr_pct_raw=0.02,
+        slot_cap=35000.0,
+        risk_budget_min=1250.0,
+        risk_budget_max=3000.0,
+    )
+    assert s.risk_budget == 3000.0
+    assert round(s.effective_slot, 2) == 35000.0
+    assert s.effective_slot < 70000.0

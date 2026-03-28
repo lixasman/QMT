@@ -57,6 +57,8 @@ class IOPVCalculator:
             except Exception:
                 bad_vol += 1
                 continue
+            if not np.isfinite(vol_f) or vol_f <= 0:
+                continue
 
             total_components += 1
             if stock_code in self.stock_prices:
@@ -67,36 +69,16 @@ class IOPVCalculator:
             if self.stocks:
                 warn_once(
                     f"iopv_components_empty:{self.etf_code}",
-                    f"IOPV: 可用成分股为 0，已降级为 NaN: etf={self.etf_code} stocks={len(self.stocks)} non_dict={non_dict} missing_vol={missing_vol} bad_vol={bad_vol}",
+                    f"IOPV: 可用成分股为 0，返回 NaN（不使用 nav 兜底）: etf={self.etf_code} stocks={len(self.stocks)} non_dict={non_dict} missing_vol={missing_vol} bad_vol={bad_vol}",
                     logger_name=__name__,
                 )
-            nav_fallback = float(self.nav_per_cu) / float(self.report_unit) if np.isfinite(self.nav_per_cu) and self.nav_per_cu > 0 and self.report_unit > 0 else float("nan")
-            if not (np.isfinite(nav_fallback) and nav_fallback > 0):
-                nav_fallback = float(self.nav) if np.isfinite(self.nav) and float(self.nav) > 0 else float("nan")
-            if np.isfinite(nav_fallback) and nav_fallback > 0:
-                info_once(
-                    f"iopv_fallback_nav:{self.etf_code}",
-                    f"IOPV: 无可用成分股价格，已使用 nav 兜底: etf={self.etf_code} nav={nav_fallback}",
-                    logger_name=__name__,
-                )
-                return nav_fallback
             return float("nan")
         if covered < total_components * 0.5:
             info_once(
                 f"iopv_low_coverage:{self.etf_code}",
-                f"IOPV: 成分股覆盖率过低，将使用 nav 兜底: etf={self.etf_code} covered={covered}/{total_components} non_dict={non_dict} missing_vol={missing_vol} bad_vol={bad_vol}",
+                f"IOPV: 成分股覆盖率过低（{covered}/{total_components}），返回 NaN（不使用 nav 兜底）: etf={self.etf_code} non_dict={non_dict} missing_vol={missing_vol} bad_vol={bad_vol}",
                 logger_name=__name__,
             )
-            nav_fallback = float(self.nav_per_cu) / float(self.report_unit) if np.isfinite(self.nav_per_cu) and self.nav_per_cu > 0 and self.report_unit > 0 else float("nan")
-            if not (np.isfinite(nav_fallback) and nav_fallback > 0):
-                nav_fallback = float(self.nav) if np.isfinite(self.nav) and float(self.nav) > 0 else float("nan")
-            if np.isfinite(nav_fallback) and nav_fallback > 0:
-                info_once(
-                    f"iopv_fallback_nav:{self.etf_code}",
-                    f"IOPV: 覆盖率不足，已使用 nav 兜底: etf={self.etf_code} covered={covered}/{total_components} nav={nav_fallback}",
-                    logger_name=__name__,
-                )
-                return nav_fallback
             return float("nan")
 
         if covered > 0 and covered < total_components:
@@ -123,7 +105,14 @@ class IOPVCalculator:
         for stock_code, stock_info in self.stocks.items():
             if not isinstance(stock_code, str) or not isinstance(stock_info, dict):
                 continue
-            if stock_info.get("componentVolume") is None:
+            vol = stock_info.get("componentVolume")
+            if vol is None:
+                continue
+            try:
+                vol_f = float(vol)
+            except Exception:
+                continue
+            if not np.isfinite(vol_f) or vol_f <= 0:
                 continue
             total += 1
             if stock_code in self.stock_prices:

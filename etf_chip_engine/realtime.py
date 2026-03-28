@@ -5,17 +5,29 @@ from dataclasses import dataclass
 from datetime import datetime
 import logging
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Optional
 
 import numpy as np
 
-from core.warn_utils import info_once
+from core.warn_utils import info_once, warn_once
 from etf_chip_engine.config import CONFIG
-from etf_chip_engine.data.xtdata_provider import calc_atr_10, download_tick_data, get_daily_bars, get_etf_info, get_market_tick_data, get_total_shares, require_xtdata
+from etf_chip_engine.data.xtdata_provider import calc_atr_10, download_tick_data, get_daily_bars, get_etf_info, get_market_tick_data, get_total_shares_detail, require_xtdata
 from etf_chip_engine.engine import ETFChipEngine, Snapshot
 from etf_chip_engine.data.xtdata_provider import prev_trade_date
+
+_LOT_SIZE = 100.0
+_RUNTIME_WARNED: set[str] = set()
+
+
+def _warn_runtime_once(key: str, msg: str) -> None:
+    warn_once(key, msg, logger_name=__name__)
+    if key in _RUNTIME_WARNED:
+        return
+    _RUNTIME_WARNED.add(key)
+    print(f"[WARN] {msg}", flush=True)
 
 
 def _as_float(x: Any, default: float = 0.0) -> float:
@@ -35,6 +47,26 @@ def _get_tick_field(rec: Any, name: str) -> Any:
     except Exception:
         pass
     return None
+
+
+def _trade_date_from_any(v: Any) -> str:
+    m = re.search(r"(\d{8})", str(v or ""))
+    return m.group(1) if m else ""
+
+
+def _history_before_trade_date(daily_df: Any, *, trade_date: str, keep_count: int):
+    import pandas as pd  # type: ignore
+
+    base = daily_df.copy() if isinstance(daily_df, pd.DataFrame) and not daily_df.empty else pd.DataFrame()
+    if base.empty:
+        return base.reset_index(drop=True)
+    if "time" in base.columns:
+        keep_mask = base["time"].map(_trade_date_from_any) != str(trade_date)
+        base = base.loc[keep_mask].reset_index(drop=True)
+    keep_n = max(int(keep_count), 0)
+    if keep_n > 0 and len(base) > keep_n:
+        base = base.tail(keep_n).reset_index(drop=True)
+    return base.reset_index(drop=True)
 
 
 @dataclass
@@ -57,7 +89,8 @@ class _EtfAccumulator:
             return None
 
         delta_amount = max(amount - self.prev_amount, 0.0)
-        delta_volume = max(volume - self.prev_volume, 0.0)
+        # XtData tick.volume 为“手”，引擎内部统一使用“股/份”。
+        delta_volume = max(volume - self.prev_volume, 0.0) * _LOT_SIZE
 
         self.prev_amount = amount
         self.prev_volume = volume
@@ -94,11 +127,42 @@ def run_realtime_once(
     if prev_state is not None and prev_state.exists():
         engine.load_state(etf_code, str(prev_state))
     else:
-        daily_df = get_daily_bars([etf_code], end_time="", count=int(cfg.get("cold_start_lookback", 60)))
-        rt_shares = float(get_total_shares(etf_code))
+        lookback = int(cfg.get("cold_start_lookback", 60))
+        daily_raw = get_daily_bars([etf_code], end_time=today, count=max(lookback, 0) + 1)
+        daily_df = _history_before_trade_date(daily_raw, trade_date=today, keep_count=lookback)
+        if str(prev_date or "").strip():
+            last_td = _trade_date_from_any(daily_df["time"].iloc[-1]) if (daily_df is not None and not daily_df.empty and "time" in daily_df.columns) else ""
+            if last_td != str(prev_date):
+                raise RuntimeError(
+                    f"stale daily history: context=realtime:{etf_code}:cold_start trade_date={today}"
+                    f" expected_last={prev_date} last_daily={last_td or 'missing'}"
+                )
+        rt_detail = get_total_shares_detail(etf_code, trade_date=today)
+        rt_shares = float(rt_detail.get("shares", 0.0))
+        rt_source = str(rt_detail.get("source", "none"))
+        if not rt_source.startswith("official_"):
+            _warn_runtime_once(
+                f"realtime_shares_source_fallback_cold_start:{today}:{etf_code}",
+                (
+                    "Realtime Shares: 官方份额不可用，冷启动已降级。"
+                    f" code={etf_code} date={today} source={rt_source}"
+                    f" reason={rt_detail.get('reason', '')}"
+                ),
+            )
         rt_atr = calc_atr_10(daily_df) if daily_df is not None and not daily_df.empty else 0.0
         engine.cold_start(etf_code, daily_df, total_shares=rt_shares, atr=rt_atr)
-    engine.chips[etf_code].total_shares = float(get_total_shares(etf_code))
+    rt_detail = get_total_shares_detail(etf_code, trade_date=today)
+    rt_source = str(rt_detail.get("source", "none"))
+    if not rt_source.startswith("official_"):
+        _warn_runtime_once(
+            f"realtime_shares_source_fallback:{today}:{etf_code}",
+            (
+                "Realtime Shares: 官方份额不可用，已降级。"
+                f" code={etf_code} date={today} source={rt_source}"
+                f" reason={rt_detail.get('reason', '')}"
+            ),
+        )
+    engine.chips[etf_code].total_shares = float(rt_detail.get("shares", 0.0))
 
     etf_info = get_etf_info(etf_code)
     if etf_info:

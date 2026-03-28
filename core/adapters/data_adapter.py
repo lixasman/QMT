@@ -10,7 +10,7 @@ from ..price_utils import limit_down_price, limit_up_price
 from ..constants import L1_STALE_THRESHOLD_SEC
 from ..enums import DataQuality
 from ..xtdata_parsing import xtdata_field_dict_to_df
-from ..warn_utils import warn_once
+from ..warn_utils import degrade_once
 
 
 try:
@@ -78,6 +78,11 @@ class XtDataAdapter(DataAdapter):
             count=int(count),
         )
         if data is None:
+            degrade_once(
+                f"xtdata_get_bars_none:{etf_code}:{period}",
+                f"Data: get_market_data returned None; fallback to empty bars. etf={etf_code} period={period} count={int(count)}",
+                logger_name="core.data",
+            )
             return []
         try:
             df = xtdata_field_dict_to_df(data, stock_code=etf_code, fields=["open", "high", "low", "close", "volume", "amount"])
@@ -111,13 +116,13 @@ class XtDataAdapter(DataAdapter):
                     )
                 return bars
 
-            warn_once(
+            degrade_once(
                 f"xtdata_get_bars_unsupported:{etf_code}:{period}",
                 f"Data: get_bars 返回结构不支持，已降级为空数据 etf={etf_code} period={period} count={int(count)}",
             )
             return []
         except Exception as e:
-            warn_once(
+            degrade_once(
                 f"xtdata_get_bars_failed:{etf_code}:{period}",
                 f"Data: get_bars 解析失败，已降级为空数据 etf={etf_code} period={period} count={int(count)} err={repr(e)}",
             )
@@ -144,6 +149,17 @@ class XtDataAdapter(DataAdapter):
             fn2(etf_code, period="tick", count=0, callback=callback)
             return
         raise RuntimeError("xtdata subscribe api not available")
+
+    def get_divid_factors(self, etf_code: str, start_time: str = "", end_time: str = "") -> Any:
+        if xtdata is None:
+            raise RuntimeError("xtquant.xtdata is not available")
+        fn = getattr(xtdata, "get_divid_factors", None)
+        if callable(fn):
+            return fn(etf_code, start_time=start_time, end_time=end_time)
+        fn2 = getattr(xtdata, "getDividFactors", None)
+        if callable(fn2):
+            return fn2(etf_code, start_time=start_time, end_time=end_time)
+        raise RuntimeError("xtdata divid factors api not available")
 
     def get_auction_volume(self, etf_code: str, date: str) -> float:
         if xtdata is None:

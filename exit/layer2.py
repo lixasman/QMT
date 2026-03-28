@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from core.enums import OrderSide, OrderType
 from core.interfaces import InstrumentInfo, OrderRequest, TickSnapshot
 from core.price_utils import align_order_price
 
-from .constants import LAYER2_THRESHOLD
+from .exit_config import get_exit_layer2_threshold
 from .types import LayerDecision
 
 
@@ -60,11 +59,13 @@ def decide_layer2(
     snapshot: TickSnapshot,
     score_soft: float,
     sellable_qty: int,
+    threshold: float | None = None,
 ) -> LayerDecision:
     score = float(score_soft)
     if not (0.0 <= score <= 2.3):
         raise AssertionError(f"Score_soft out of range: {score}")
-    if float(score) < float(LAYER2_THRESHOLD):
+    gate = float(get_exit_layer2_threshold()) if threshold is None else float(threshold)
+    if float(score) < float(gate):
         return LayerDecision(action="HOLD", order=None, reason="SCORE_BELOW_THRESHOLD", extra={})
 
     plan = plan_layer2_reduce_50(instrument=instrument, snapshot=snapshot, sellable_qty=int(sellable_qty))
@@ -88,4 +89,3 @@ def decide_layer2(
         reason="SCORE_TRIGGER",
         extra={"score_soft": float(score), "sell_qty": int(plan.sell_qty), "sell_price": float(plan.sell_price)},
     )
-

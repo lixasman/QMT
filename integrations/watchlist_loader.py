@@ -129,6 +129,7 @@ def load_watchlist_items(
     etf_codes: Iterable[str],
     now: Optional[datetime] = None,
     integration_dir: str | Path = "output/integration",
+    load_sentiment: bool = True,
 ) -> WatchlistLoadResult:
     today = _today_yyyymmdd(now)
     base = Path(integration_dir)
@@ -156,16 +157,18 @@ def load_watchlist_items(
         c6 = code6(c0)
 
         s_path = None
-        if fin_dir.exists() and c6:
-            candidates = list(fin_dir.glob(f"sentiment_{c6}_*.json"))
-            best = _pick_latest_before(candidates, today=today, date_re=rf"sentiment_{re.escape(c6)}_(\d{{8}})\.json$")
-            s_path = best
-        if s_path is None and c6:
-            warn_once(
-                f"sentiment_missing:{c6}:{today}",
-                f"Integration: 未找到 sentiment JSON（仅使用 today={today} 之前的文件），etf={cn} dir={fin_dir}，情绪分数将降级为默认值",
-            )
-        s_obj = _load_sentiment_obj(s_path) if s_path is not None else {}
+        s_obj: dict[str, Any] = {}
+        if bool(load_sentiment):
+            if fin_dir.exists() and c6:
+                candidates = list(fin_dir.glob(f"sentiment_{c6}_*.json"))
+                best = _pick_latest_before(candidates, today=today, date_re=rf"sentiment_{re.escape(c6)}_(\d{{8}})\.json$")
+                s_path = best
+            if s_path is None and c6:
+                warn_once(
+                    f"sentiment_missing:{c6}:{today}",
+                    f"Integration: 未找到 sentiment JSON（仅使用 today={today} 之前的文件），etf={cn} dir={fin_dir}，情绪分数将降级为默认值",
+                )
+            s_obj = _load_sentiment_obj(s_path) if s_path is not None else {}
 
         score100 = _parse_int(s_obj.get("sentiment_score_100"))
         score01 = _parse_float(s_obj.get("sentiment_score_01"))
@@ -185,9 +188,16 @@ def load_watchlist_items(
             profit_ratio = 0.0
 
         nearest_resistance = _parse_float(r.get("resistance_price_max_density"))
+        # Compatible with both legacy "ms_*" columns and current batch_results schema.
         vpin_rank = _parse_float(r.get("ms_vpin_rank"))
+        if vpin_rank is None:
+            vpin_rank = _parse_float(r.get("vpin_rank"))
         ofi_daily = _parse_float(r.get("ms_ofi_daily_z"))
+        if ofi_daily is None:
+            ofi_daily = _parse_float(r.get("ofi_daily_z"))
         vs_max = _parse_float(r.get("ms_vs_max_logz"))
+        if vs_max is None:
+            vs_max = _parse_float(r.get("vs_max_logz"))
 
         item = WatchlistItem(
             etf_code=str(cn),
